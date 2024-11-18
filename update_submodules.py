@@ -37,6 +37,15 @@ def get_submodule_dependencies(directory_name: str, checked_out_repos: Set[str])
                     dependencies[repo].add(submodule_path)
                     if submodule_path not in dependencies:
                         dependencies[submodule_path] = set()  # Ensure all submodules are in the dependencies dictionary
+                else:
+                    # Check if the submodule is nested within another repo
+                    for checked_out_repo in checked_out_repos:
+                        if submodule_url.startswith(checked_out_repo):
+                            print(f"Submodule {submodule_path} found nested within {checked_out_repo}")
+                            dependencies[repo].add(submodule_path)
+                            if submodule_path not in dependencies:
+                                dependencies[submodule_path] = set()
+                            break
     return dependencies
 
 def topological_sort(dependencies: Dict[str, Set[str]]) -> list:
@@ -102,6 +111,32 @@ def get_current_branch(repo_path: str) -> str:
 def update_submodule(submodule_path: str) -> None:
     run_git_command(['git', 'submodule', 'update', '--init', '--recursive'], cwd=submodule_path)
 
+def get_submodule_url(repo_path: str, submodule_path: str) -> str:
+    print(f"Getting submodule URL for {submodule_path} in {repo_path}")
+    result = subprocess.run(['git', 'config', '--file', '.gitmodules', '--get-regexp', f'submodule.*.path'], cwd=repo_path, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise ValueError(f"Could not get submodule URL for {submodule_path} in {repo_path}")
+    print(f"Found .gitmodules file: {result.stdout}")
+    submodule_urls = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        submodule_name = parts[0].split('.')[1]
+        submodule_urls[submodule_name] = parts[1]
+    
+    print(f"Submodule paths found: {submodule_urls}")
+    
+    for submodule_name, path in submodule_urls.items():
+        if path == submodule_path:
+            result = subprocess.run(['git', 'config', '--file', '.gitmodules', '--get', f'submodule.{submodule_name}.url'], cwd=repo_path, capture_output=True, text=True)
+            if result.returncode == 0:
+                submodule_url = result.stdout.strip()
+                print(f"Found URL for submodule {submodule_name}: {submodule_url}")
+                return submodule_url
+            else:
+                raise ValueError(f"Could not get URL for submodule {submodule_name} in {repo_path}")
+    
+    raise ValueError(f"Submodule path {submodule_path} not found in {repo_path}")
+
 def update_submodules(directory_name: str, tag: str = None) -> None:
     print(f"Updating repos in {directory_name}")
     checked_out_repos = get_checked_out_repos(directory_name)
@@ -128,7 +163,9 @@ def update_submodules(directory_name: str, tag: str = None) -> None:
 
             update_submodule(submodule_path)
 
-            latest_revision = get_revision(os.path.join(directory_name, submodule))            
+            submodule_url = get_submodule_url(repo_path, submodule)
+            latest_revision = get_revision(os.path.join(directory_name, os.path.splitext(submodule_url.split('/')[-1])[0]))
+            
             current_revision = get_revision(submodule_path)
             if current_revision != latest_revision:
                 run_git_command(['git', 'fetch'], cwd=submodule_path, hide_output=True)

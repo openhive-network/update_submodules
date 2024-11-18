@@ -67,7 +67,6 @@ def get_gitlab_project_id(repo_path: str) -> str:
     headers = {"PRIVATE-TOKEN": GITLAB_TOKEN}
     print(f"Making API call: GET {url}")
     response = requests.get(url, headers=headers)
-    print(f"API Response: {response.status_code} {response.text}")  # Debug output
     if response.status_code == 200:
         project_id = response.json()['id']
         return project_id
@@ -100,8 +99,21 @@ def delete_updated_submodule_branches_and_tag(directory_name: str, tag: str = No
             branch = branch.strip()
             if 'origin/update-submodules-py' in branch:
                 branch_name = branch.replace('origin/', '')
-                print(f"Deleting branch {branch_name} in {repo_path}")
+                print(f"Deleting remote branch {branch_name} in {repo_path}")
                 run_git_command(['git', 'push', 'origin', '--delete', branch_name], cwd=repo_path)
+
+        # Get list of local branches
+        result = subprocess.run(['git', 'branch'], cwd=repo_path, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"Failed to list local branches in {repo_path}")
+            sys.exit(1)
+
+        local_branches = result.stdout.splitlines()
+        for branch in local_branches:
+            branch = branch.strip()
+            if branch == 'update-submodules-py':
+                print(f"Deleting local branch {branch} in {repo_path}")
+                run_git_command(['git', 'branch', '-d', branch], cwd=repo_path)
 
         # Delete the specified tag if it exists
         if tag:
