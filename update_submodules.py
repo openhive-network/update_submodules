@@ -20,13 +20,23 @@ def get_submodule_dependencies(directory_name: str, checked_out_repos: Set[str])
         with open(gitmodules_path, 'r') as file:
             content = file.read()
         
+        submodule_path = None
         for line in content.splitlines():
+            if line.strip().startswith('path ='):
+                submodule_path = line.split('=')[1].strip()
             if line.startswith('[submodule'):
                 submodule_name = line.split('"')[1]
-                if submodule_name in checked_out_repos:
-                    dependencies[repo].add(submodule_name)
-                    if submodule_name not in dependencies:
-                        dependencies[submodule_name] = set()  # Ensure all submodules are in the dependencies dictionary
+            elif line.strip().startswith('url ='):
+                submodule_url = line.split('=')[1].strip()
+                submodule_url = os.path.normpath(submodule_url).replace('.git', '')
+                if submodule_url.startswith('..\\'):
+                    submodule_url = submodule_url[3:]
+                print(f"Checking submodule URL: {submodule_url} against checked out repos")
+                if submodule_url in checked_out_repos:
+                    print(f"Submodule {submodule_path} found in checked out repos")
+                    dependencies[repo].add(submodule_path)
+                    if submodule_path not in dependencies:
+                        dependencies[submodule_path] = set()  # Ensure all submodules are in the dependencies dictionary
     return dependencies
 
 def topological_sort(dependencies: Dict[str, Set[str]]) -> list:
@@ -135,11 +145,13 @@ def update_submodules(directory_name: str, tag: str = None) -> None:
                 run_git_command(['git', 'commit', '-am', f'Update_submodules.py'], cwd=repo_path)
             new_hash = get_revision(repo_path)
             print(f"Committed changes in {dir_name} with new hash {new_hash}")
-            if tag:
-                run_git_command(['git', 'tag', tag], cwd=repo_path)
             run_git_command(['git', 'push', '--set-upstream', 'origin', 'update-submodules-py'], cwd=repo_path, hide_output=True)
             run_git_command(['git', 'checkout', '--detach', 'HEAD'], cwd=repo_path)
             run_git_command(['git', 'branch', '-d', 'update-submodules-py'], cwd=repo_path)
+
+        if tag:
+            run_git_command(['git', 'tag', tag], cwd=repo_path)
+            run_git_command(['git', 'push', 'origin', tag], cwd=repo_path)
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
