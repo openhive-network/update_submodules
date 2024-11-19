@@ -12,6 +12,7 @@ git clone git@gitlab.syncad.com:hive/reputation_tracker
 git clone git@gitlab.syncad.com:hive/balance_tracker
 git clone git@gitlab.syncad.com:hive/haf_block_explorer
 git clone git@gitlab.syncad.com:hive/hivemind
+git clone git@gitlab.syncad.com:hive/haf_api_node
 ```
 
 Next, checkout the versions of each app you want to use. If you want to use the head of develop for everything, you can use the `checkout_develop_versions.py` script to move all the repos to the latest head of develop. Once you have the versions you want, run the `update_submodules.py` script to update all the repos and push the changes back to the origin repo. If you change your mind, or something goes wrong, you can use `revert_update_submodules.py` to revert your changes.
