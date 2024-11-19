@@ -181,8 +181,11 @@ def topological_sort(graph):
     return sorted_list
 
 def get_repo_name(repo_url):
-    """Extract the short repository name from the URL."""
-    return repo_url.rstrip('/').split('/')[-1]
+    """Extract the repository name from the URL without the .git extension."""
+    repo_name = repo_url.rstrip('/').split('/')[-1]
+    if repo_name.endswith('.git'):
+        repo_name = repo_name[:-4]
+    return repo_name
 
 def get_submodule_current_commit(repo, submodule):
     """Get the current commit hash of the submodule as recorded in the parent repo."""
@@ -232,7 +235,11 @@ def is_branch(ref, repo):
     except GitCommandError:
         return False
 
-def validate_refs(config):
+def is_remote_branch(ref, repo):
+    """Check if the reference exists as a remote branch."""
+    return any(r.name.split('/')[-1] == ref for r in repo.remotes.origin.refs)
+
+def validate_refs(config, tag=None):
     """Validate that all refs in the config are valid."""
     invalid_refs = []
     for repo_url, settings in config.items():
@@ -296,7 +303,7 @@ def validate_refs(config):
                 # Fetch all refs
                 repo.remotes.origin.fetch()
                 # Check if ref exists as branch, tag, or commit
-                if is_branch(desired_ref, repo) or desired_ref in [tag.name for tag in repo.tags]:
+                if is_branch(desired_ref, repo) or desired_ref in [tag.name for tag in repo.tags] or is_remote_branch(desired_ref, repo):
                     continue
                 else:
                     # Attempt to resolve as a commit hash
@@ -313,11 +320,12 @@ def validate_refs(config):
         for repo_url, invalid_ref in invalid_refs:
             logging.error(f"Invalid ref '{invalid_ref}' for repository '{repo_url}'.")
         logging.error("Ref validation failed. Please correct the invalid refs and try again.")
-        if any(repo_url for repo_url, _ in invalid_refs):
+        if tag:
             logging.error("If you intend to overwrite existing tags, you can re-run the script with the '--retag' option.")
         sys.exit(1)
     else:
         logging.info("All refs in the configuration are valid.")
+
 
 def generate_branch_name(repo_url, tag=None, counter=None):
     """Generate a unique branch name."""
@@ -782,7 +790,7 @@ def main():
 
     config = load_config(CONFIG_FILE)
     validate_config(config)
-    validate_refs(config)
+    validate_refs(config, tag=args.tag)  # Pass the tag argument here
 
     dependency_graph = build_dependency_graph(config)
     sorted_repos = topological_sort(dependency_graph)
