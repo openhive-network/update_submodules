@@ -35,7 +35,7 @@ Usage:
 A script that updates Git submodules across multiple repositories in a specified directory. It:
 - Analyzes dependencies between repositories
 - Updates submodules in the correct order
-- Creates branches with the submodule updateds called `update-submodules-py`
+- Creates branches with the submodules updated called `update-submodules-py`
 - Optionally adds a common tag to all the repos
 - Pushes changes to remote repositories
 
