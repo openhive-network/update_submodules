@@ -228,7 +228,7 @@ def get_submodule_current_commit(repo, submodule):
 def get_submodule_desired_commit(submodule_repo, desired_ref):
     """Get the commit hash of the desired reference in the submodule."""
     try:
-        submodule_repo.git.fetch()
+        submodule_repo.remotes.origin.fetch()
         # Check if ref exists as a local branch
         if is_branch(desired_ref, submodule_repo):
             submodule_repo.git.checkout(desired_ref)
@@ -379,12 +379,25 @@ def create_merge_request(repo, source_branch, target_branch, automerge=False):
     ]
     if automerge:
         push_options.append('merge_request.merge_when_pipeline_succeeds=true')
-    # Join the options with commas
-    push_options_str = ','.join(push_options)
-    return push_options_str
+    return push_options
 
-def update_repo(repo_url, desired_ref, config, tag=None, retag=False, dry_run=False, updated_repos_branches={}):
-    """Update a single repository and its submodules."""
+def update_repo(repo_url, desired_ref, config, tag=None, retag=False, dry_run=False, updated_repos_branches=None):
+    """
+    Update a single repository and its submodules.
+
+    Args:
+        repo_url (str): The URL of the repository to update.
+        desired_ref (str): The desired Git reference (branch or commit hash).
+        config (dict): The configuration dictionary loaded from repos.yaml.
+        tag (str, optional): The name of the Git tag to create. Defaults to None.
+        retag (bool, optional): Whether to overwrite existing tags. Defaults to False.
+        dry_run (bool, optional): If True, perform a dry run without making changes. Defaults to False.
+        updated_repos_branches (dict, optional): A mapping of repository URLs to their updated feature branch names.
+                                                 Defaults to None.
+    """
+    if updated_repos_branches is None:
+        updated_repos_branches = {}
+
     clone_path = os.path.join(BASE_DIR, get_repo_name(repo_url))
     repo = clone_repo(repo_url, clone_path)
 
@@ -396,7 +409,7 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, dry_run=Fa
     settings = config.get(repo_url, {})
     ref_from_dir = settings.get('ref_from_dir')
     automerge = settings.get('automerge', False)
-    create_merge_request = settings.get('create_merge_request', True)
+    create_mr = settings.get('create_merge_request', True)
 
     # Initialize updated_yaml_files to ensure it's always defined
     updated_yaml_files = {}
@@ -419,25 +432,28 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, dry_run=Fa
     if updated_submodules:
         # Create a feature branch for the updates
         branch_name = create_feature_branch(repo, repo_url, tag, dry_run)
+
         if branch_name is None and dry_run:
             # In dry run, skip further actions
             pass
         else:
-            # Commit the submodule updates
-            commit_changes(repo, repo_url, updated_submodules)
-
-            # Push the feature branch and create a merge request if applicable
-            push_branch(repo, repo_url, branch_name, settings, automerge, create_merge_request, dry_run)
-
-            # Record the branch to update parent repositories
-            updated_repos_branches.update(updated_submodules)  # Updated to store absolute URLs
-
             # Collect YAML file updates based on submodule updates
             updated_yaml_files = collect_yaml_updates(settings, updated_submodules)
 
             # Process YAML file updates
             if updated_yaml_files:
                 process_yaml_updates(clone_path, updated_yaml_files, submodule_commits, dry_run)
+
+            # Commit the submodule updates
+            commit_changes(repo, repo_url, updated_submodules)
+
+            # Push the feature branch and create a merge request if applicable
+            push_branch(repo, repo_url, branch_name, settings, automerge, create_mr, dry_run)
+
+            if not dry_run:
+                # Record the branch to update parent repositories
+                updated_repos_branches[repo_url] = branch_name
+                logging.debug(f"Recorded updated branch '{branch_name}' for repository '{repo_url}' in 'updated_repos_branches'.")
 
     # Handle tagging
     handle_tagging(repo, repo_url, tag, retag, dry_run)
@@ -641,17 +657,21 @@ def commit_changes(repo, repo_url, updated_submodules):
         logging.error(f"Failed to commit changes in '{get_repo_name(repo_url)}': {e}")
         sys.exit(1)
 
-def push_branch(repo, repo_url, branch_name, settings, automerge, create_merge_request, dry_run):
+def push_branch(repo, repo_url, branch_name, settings, automerge, create_mr, dry_run):
     """Push the feature branch to the remote repository and create a merge request if applicable."""
     if dry_run:
         logging.info("Dry run enabled. Push actions skipped.")
         return
 
     try:
-        if create_merge_request:
-            push_options = create_merge_request(repo, branch_name, settings.get('target_branch', 'main'), automerge=automerge)
-            repo.remotes.origin.push(refspec=f"{branch_name}:{branch_name}", push_options=[push_options])
-            logging.info(f"Pushed branch '{branch_name}' to '{repo_url}' with push options for merge request.")
+        if create_mr:
+            # Determine the target branch: use 'target_branch' if specified, else default to 'ref', else 'main'
+            target_branch = settings.get('target_branch', settings.get('ref', 'main'))
+            push_options = create_merge_request(repo, branch_name, target_branch, automerge=automerge)
+            logging.debug(f"Pushing branch '{branch_name}' with push options: {push_options}")
+            # Pass push_options as a single string within a list
+            repo.remotes.origin.push(refspec=f"{branch_name}:{branch_name}", push_option=push_options)
+            logging.info(f"Pushed branch '{branch_name}' to '{repo_url}' with push options for merge request targeting '{target_branch}'.")
         else:
             repo.remotes.origin.push(refspec=f"{branch_name}:{branch_name}")
             logging.info(f"Pushed branch '{branch_name}' to '{repo_url}'.")
