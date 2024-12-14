@@ -102,6 +102,31 @@ def validate_config(config):
                     sys.exit(1)
     logging.info("Configuration validation passed.")
 
+def resolve_submodule_url(parent_repo_url, submodule_url):
+    """Resolve a submodule URL relative to the parent repo URL if necessary."""
+    # If the submodule URL is already absolute (starts with git@, http, ssh, etc.),
+    # we assume it's a full URL.
+    if submodule_url.startswith('git@') or submodule_url.startswith('http://') \
+       or submodule_url.startswith('https://') or submodule_url.startswith('ssh://'):
+        return submodule_url
+
+    # Split the parent URL into host part and path part.
+    # Example:
+    #   parent: git@gitlab.syncad.com:hive/reputation_tracker.git
+    #   submodule: ../haf.git
+    if ':' not in parent_repo_url:
+        # If the parent URL doesn't fit the expected pattern, return submodule_url as-is.
+        return submodule_url
+
+    host_part, base_dir = parent_repo_url.split(':', 1)  # e.g., 'git@gitlab.syncad.com' and 'hive/reputation_tracker.git'
+
+    # Combine the base directory with the submodule's relative URL
+    combined_path = os.path.normpath(os.path.join(base_dir, submodule_url))
+
+    # Construct the absolute URL
+    absolute_url = f"{host_part}:{combined_path}"
+    return absolute_url
+
 def clone_repo(repo_url, clone_path):
     """Clone the repository if not already cloned."""
     if os.path.exists(clone_path):
@@ -126,12 +151,21 @@ def clone_repo(repo_url, clone_path):
             return None
 
 def parse_submodules(repo):
-    """Parse submodules from a repository."""
+    """Parse submodules from a repository and return absolute URLs."""
     submodules = []
     gitmodules_path = os.path.join(repo.working_tree_dir, '.gitmodules')
     if os.path.exists(gitmodules_path):
+        # Get the parent repo URL to resolve relative submodule URLs
+        try:
+            parent_repo_url = repo.remotes.origin.url
+        except AttributeError:
+            parent_repo_url = None
+
         for submodule in repo.submodules:
-            submodules.append(submodule.url)
+            sub_url = submodule.url
+            if parent_repo_url:
+                sub_url = resolve_submodule_url(parent_repo_url, sub_url)
+            submodules.append(sub_url)
     return submodules
 
 def build_dependency_graph(config):
@@ -326,8 +360,7 @@ def validate_refs(config, tag=None):
     else:
         logging.info("All refs in the configuration are valid.")
 
-
-def generate_branch_name(repo_url, tag=None, counter=None):
+def create_branch_name(repo_url, tag=None, counter=None):
     """Generate a unique branch name."""
     base_name = "update-submodules"
     if tag:
@@ -397,7 +430,7 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, dry_run=Fa
             push_branch(repo, repo_url, branch_name, settings, automerge, create_merge_request, dry_run)
 
             # Record the branch to update parent repositories
-            updated_repos_branches[repo_url] = branch_name
+            updated_repos_branches.update(updated_submodules)  # Updated to store absolute URLs
 
             # Collect YAML file updates based on submodule updates
             updated_yaml_files = collect_yaml_updates(settings, updated_submodules)
@@ -474,53 +507,76 @@ def identify_submodule_updates(repo, config, updated_repos_branches):
     updated_submodules = {}
     submodule_commits = {}
 
+    # Get the parent repo URL to resolve submodule URLs
+    try:
+        parent_repo_url = repo.remotes.origin.url
+    except AttributeError:
+        parent_repo_url = None
+
     for submodule in repo.submodules:
-        if submodule.url in config:
+        original_sub_url = submodule.url
+        if parent_repo_url:
+            resolved_sub_url = resolve_submodule_url(parent_repo_url, original_sub_url)
+        else:
+            resolved_sub_url = original_sub_url  # Fallback if origin is not set
+
+        logging.debug(f"Working on submodule '{original_sub_url}' resolved to '{resolved_sub_url}' of repo '{parent_repo_url}'")
+
+        if resolved_sub_url in config:
+            logging.debug(f"Submodule '{resolved_sub_url}' is in the config.")
+
             # Determine the desired reference for the submodule
-            desired_ref_submodule = determine_submodule_ref(submodule, config, updated_repos_branches)
+            desired_ref_submodule = determine_submodule_ref(submodule, config, updated_repos_branches, parent_repo_url)
 
             if desired_ref_submodule is None:
-                logging.error(f"Desired ref is None for submodule '{get_repo_name(submodule.url)}'. Skipping.")
+                logging.error(f"Desired ref is None for submodule '{get_repo_name(resolved_sub_url)}'. Skipping.")
                 continue
 
             # Get the desired commit hash
             desired_commit = get_submodule_desired_commit(submodule.module(), desired_ref_submodule)
+            logging.debug(f"Desired commit for submodule '{get_repo_name(resolved_sub_url)}' is {desired_commit}")
 
             if desired_commit is None:
-                logging.error(f"Failed to determine desired commit for submodule '{get_repo_name(submodule.url)}'.")
+                logging.error(f"Failed to determine desired commit for submodule '{get_repo_name(resolved_sub_url)}'.")
                 continue
 
             # Get the current commit hash of the submodule
             current_commit = get_submodule_current_commit(repo, submodule)
 
             if current_commit != desired_commit:
-                logging.info(f"Submodule '{get_repo_name(submodule.url)}' is at {current_commit}, needs to be updated to '{desired_ref_submodule}' ({desired_commit}).")
-                updated_submodules[submodule.url] = {
-                    'name': get_repo_name(submodule.url),
+                logging.info(f"Submodule '{get_repo_name(resolved_sub_url)}' is at {current_commit}, needs to be updated to '{desired_ref_submodule}' ({desired_commit}).")
+                updated_submodules[resolved_sub_url] = {
+                    'name': get_repo_name(resolved_sub_url),
                     'ref': desired_ref_submodule,
                     'commit': desired_commit
                 }
-                submodule_commits[submodule.url] = desired_commit
+                submodule_commits[resolved_sub_url] = desired_commit
 
                 # Stage the submodule path to update the pointer
                 repo.git.add(submodule.path)
-                logging.debug(f"Staged submodule '{get_repo_name(submodule.url)}' for update.")
+                logging.debug(f"Staged submodule '{get_repo_name(resolved_sub_url)}' for update.")
 
     return updated_submodules, submodule_commits
 
-def determine_submodule_ref(submodule, config, updated_repos_branches):
+def determine_submodule_ref(submodule, config, updated_repos_branches, parent_repo_url):
     """Determine the desired reference for a submodule."""
-    if submodule.url in updated_repos_branches:
+    original_sub_url = submodule.url
+    if parent_repo_url:
+        resolved_sub_url = resolve_submodule_url(parent_repo_url, original_sub_url)
+    else:
+        resolved_sub_url = original_sub_url  # Fallback if origin is not set
+
+    if resolved_sub_url in updated_repos_branches:
         # Use the feature branch from the mapping
-        desired_ref_submodule = updated_repos_branches[submodule.url]
-        logging.debug(f"Submodule '{get_repo_name(submodule.url)}' is being updated via branch '{desired_ref_submodule}'.")
+        desired_ref_submodule = updated_repos_branches[resolved_sub_url]
+        logging.debug(f"Submodule '{get_repo_name(resolved_sub_url)}' is being updated via branch '{desired_ref_submodule}'.")
     else:
         # Use the configured ref or ref_from_dir
-        sub_settings = config[submodule.url]
+        sub_settings = config[resolved_sub_url]
         sub_ref_from_dir = sub_settings.get('ref_from_dir')
         if sub_ref_from_dir:
             # Use the ref from the local directory
-            desired_ref_submodule = get_ref_from_directory(submodule.url, sub_ref_from_dir)
+            desired_ref_submodule = get_ref_from_directory(resolved_sub_url, sub_ref_from_dir)
         else:
             desired_ref_submodule = sub_settings.get('ref')
     return desired_ref_submodule
@@ -550,9 +606,9 @@ def create_feature_branch(repo, repo_url, tag, dry_run):
     while not branch_created:
         if tag:
             # Pass 'counter' only if it's greater than 1 to maintain naming consistency
-            candidate_branch = generate_branch_name(repo_url, tag=tag, counter=counter if counter > 1 else None)
+            candidate_branch = create_branch_name(repo_url, tag=tag, counter=counter if counter > 1 else None)
         else:
-            candidate_branch = generate_branch_name(repo_url, counter=counter if counter > 1 else None)
+            candidate_branch = create_branch_name(repo_url, counter=counter if counter > 1 else None)
 
         if candidate_branch not in existing_branches:
             branch_name = candidate_branch
@@ -608,7 +664,9 @@ def collect_yaml_updates(current_repo_settings, updated_submodules):
     updated_yaml_files = {}
     update_yaml_entries = current_repo_settings.get('update_yaml', [])
     for edit in update_yaml_entries:
-        if edit['submodule_referenced'] in updated_submodules:
+        # The 'submodule_referenced' should be an absolute URL as per the config
+        submodule_referenced_url = edit['submodule_referenced']
+        if submodule_referenced_url in updated_submodules:
             filename = edit['filename']
             key_to_update = edit['key_to_update']
             if filename not in updated_yaml_files:
@@ -616,7 +674,7 @@ def collect_yaml_updates(current_repo_settings, updated_submodules):
             updated_yaml_files[filename].append({
                 'filename': filename,  # Ensure 'filename' is included
                 'key_to_update': key_to_update,
-                'submodule_referenced': edit['submodule_referenced']
+                'submodule_referenced': submodule_referenced_url  # Use absolute URL
             })
     return updated_yaml_files
 
@@ -798,24 +856,24 @@ def main():
     sorted_repos.reverse()
 
     logging.info("Processing repositories in the following order:")
-    for repo in sorted_repos:
-        logging.info(f"- {get_repo_name(repo)}")
+    for repo_url in sorted_repos:
+        logging.info(f"- {get_repo_name(repo_url)}")
 
     # Initialize a mapping to track repositories updated via branches
     updated_repos_branches = {}
 
-    for repo in sorted_repos:
-        settings = config.get(repo, {})
+    for repo_url in sorted_repos:
+        settings = config.get(repo_url, {})
         if not settings:
-            logging.error(f"No settings found for repository '{repo}'. Skipping.")
+            logging.error(f"No settings found for repository '{repo_url}'. Skipping.")
             continue
         tag = args.tag
         retag = args.retag
         desired_ref = settings.get('ref') if 'ref' in settings else None
         desired_ref_from_dir = settings.get('ref_from_dir') if 'ref_from_dir' in settings else None
-        logging.info(f"\nUpdating repository '{get_repo_name(repo)}' to '{desired_ref if desired_ref else 'ref_from_dir'}'...")
+        logging.info(f"\nUpdating repository '{get_repo_name(repo_url)}' to '{desired_ref if desired_ref else 'ref_from_dir'}'...")
         update_repo(
-            repo_url=repo,
+            repo_url=repo_url,
             desired_ref=desired_ref,
             config=config,
             tag=tag,
