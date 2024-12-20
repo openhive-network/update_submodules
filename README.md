@@ -31,17 +31,6 @@ Usage:
 
 `python checkout_develop_versions.py ../src`
 
-### update_submodules.py
-A script that updates Git submodules across multiple repositories in a specified directory. It:
-- Analyzes dependencies between repositories
-- Updates submodules in the correct order
-- Creates branches with the submodules updated called `update-submodules-py`
-- Optionally adds a common tag to all the repos
-- Pushes changes to remote repositories
-
-Usage:
-`python update_submodules.py ../src [tag]`
-
 ### revert_update_submodules.py
 A cleanup script that reverts changes made by update_submodules.py. It:
 
