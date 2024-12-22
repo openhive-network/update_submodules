@@ -41,6 +41,6 @@ git@gitlab.syncad.com:hive/haf_block_explorer.git:
   ref: 'develop'
   automerge: true
   update_yaml:
-    - filename: '.gitlab-ci.yaml'
+    - filename: '.gitlab-ci.yml'
       key_to_update: 'include[project=hive/haf].ref'
       submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
