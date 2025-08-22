@@ -6,6 +6,10 @@ import yaml
 import git
 import argparse
 import logging
+import requests
+import configparser
+from dataclasses import dataclass
+from typing import Optional, Dict, List
 from collections import defaultdict
 from ruamel.yaml import YAML
 from git import Repo, GitCommandError
@@ -13,6 +17,27 @@ from git import Repo, GitCommandError
 # Configuration
 CONFIG_FILE = 'repos.yaml'
 BASE_DIR = 'repositories'  # Directory to clone repositories into
+
+@dataclass
+class RepoOperationResult:
+    """Track the result of processing a single repository."""
+    repo_url: str
+    branch_name: Optional[str] = None
+    submodules_updated: Dict = None
+    yaml_files_updated: Dict = None
+    tag_to_create: Optional[str] = None
+    success: bool = True
+    error_message: Optional[str] = None
+    repo_object: Optional[Repo] = None  # Store the repo object for Phase 2
+    settings: Dict = None  # Store repository settings for Phase 2
+    
+    def __post_init__(self):
+        if self.submodules_updated is None:
+            self.submodules_updated = {}
+        if self.yaml_files_updated is None:
+            self.yaml_files_updated = {}
+        if self.settings is None:
+            self.settings = {}
 
 def setup_logging(log_level):
     """Configure the logging settings."""
@@ -36,7 +61,90 @@ def parse_arguments():
     parser.add_argument('--log-level', '-l', default='INFO', help='Set the logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL). Default is INFO.')
     parser.add_argument('--tag', '-t', type=str, help='Name of the Git tag to create for each repository.')
     parser.add_argument('--retag', '-r', action='store_true', help='Overwrite existing tags with the same name when using --tag.')
+    parser.add_argument('--cleanup', action='store_true', help='Clean up branches, tags, and MRs from a previous failed run.')
+    parser.add_argument('--cleanup-tag', type=str, help='Specific tag to clean up when using --cleanup.')
     return parser.parse_args()
+
+def get_gitlab_credentials():
+    """Get GitLab API credentials from environment variables or config file."""
+    # Priority: environment variables > config file
+    token = os.environ.get('GITLAB_TOKEN')
+    api_url = os.environ.get('GITLAB_API_URL', 'https://gitlab.syncad.com/api/v4')
+    
+    if not token:
+        # Fall back to config.ini if exists
+        config = configparser.ConfigParser()
+        if os.path.exists('config.ini'):
+            config.read('config.ini')
+            token = config.get('gitlab', 'token', fallback=None)
+            api_url = config.get('gitlab', 'api_url', fallback=api_url)
+    
+    return token, api_url
+
+def get_gitlab_project_id(repo_url):
+    """Get the GitLab project ID from the repository URL."""
+    token, api_url = get_gitlab_credentials()
+    if not token:
+        return None
+        
+    # Extract namespace and project from URL
+    if repo_url.startswith('git@'):
+        # Format: git@gitlab.syncad.com:namespace/project.git
+        parts = repo_url.split(':')[1].rstrip('.git').split('/')
+        namespace = parts[0]
+        project = parts[1] if len(parts) > 1 else parts[0]
+    elif repo_url.startswith('http'):
+        # Format: https://gitlab.syncad.com/namespace/project.git
+        parts = repo_url.rstrip('.git').split('/')
+        namespace = parts[-2]
+        project = parts[-1]
+    else:
+        logging.error(f"Unsupported repository URL format: {repo_url}")
+        return None
+    
+    # Query GitLab API for project ID
+    url = f"{api_url}/projects/{namespace}%2F{project}"
+    headers = {"PRIVATE-TOKEN": token}
+    
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            return response.json()['id']
+        else:
+            logging.error(f"Failed to get project ID for {namespace}/{project}: {response.status_code}")
+            return None
+    except Exception as e:
+        logging.error(f"Error getting project ID: {e}")
+        return None
+
+def delete_gitlab_tag_via_api(repo_url, tag):
+    """Delete a tag using the GitLab API (works for protected tags)."""
+    token, api_url = get_gitlab_credentials()
+    if not token:
+        logging.warning("No GitLab token available, cannot delete protected tags via API")
+        return False
+        
+    project_id = get_gitlab_project_id(repo_url)
+    if not project_id:
+        return False
+        
+    url = f"{api_url}/projects/{project_id}/repository/tags/{tag}"
+    headers = {"PRIVATE-TOKEN": token}
+    
+    try:
+        response = requests.delete(url, headers=headers)
+        if response.status_code == 204:
+            logging.info(f"Successfully deleted tag '{tag}' via GitLab API")
+            return True
+        elif response.status_code == 404:
+            logging.debug(f"Tag '{tag}' not found on remote")
+            return True  # Tag doesn't exist, which is what we wanted
+        else:
+            logging.error(f"Failed to delete tag '{tag}' via API: {response.status_code} {response.text}")
+            return False
+    except Exception as e:
+        logging.error(f"Error deleting tag via API: {e}")
+        return False
 
 def load_config(config_path):
     """Load the YAML configuration file."""
@@ -127,8 +235,44 @@ def resolve_submodule_url(parent_repo_url, submodule_url):
     absolute_url = f"{host_part}:{combined_path}"
     return absolute_url
 
+def cleanup_existing_repo(repo):
+    """Clean up an existing repository to ensure a clean state."""
+    try:
+        # Reset any uncommitted changes
+        repo.git.reset('--hard', 'HEAD')
+        
+        # Clean untracked files and directories
+        repo.git.clean('-fd')
+        
+        # Delete local branches from previous runs
+        current_branch = repo.active_branch.name if not repo.head.is_detached else None
+        for branch in repo.heads:
+            if 'update-submodules' in branch.name:
+                if branch.name != current_branch:
+                    try:
+                        repo.delete_head(branch, force=True)
+                        logging.debug(f"Deleted local branch '{branch.name}'")
+                    except GitCommandError as e:
+                        logging.warning(f"Could not delete branch '{branch.name}': {e}")
+        
+        # Ensure we're on a valid branch (not detached HEAD)
+        if repo.head.is_detached:
+            # Try to checkout main or master
+            for default_branch in ['main', 'master', 'develop']:
+                if default_branch in [b.name for b in repo.heads]:
+                    repo.git.checkout(default_branch)
+                    logging.debug(f"Checked out default branch '{default_branch}'")
+                    break
+        
+        # Fetch latest from origin with prune
+        repo.remotes.origin.fetch(prune=True)
+        
+    except GitCommandError as e:
+        logging.error(f"Error cleaning up repository: {e}")
+        raise
+
 def clone_repo(repo_url, clone_path):
-    """Clone the repository if not already cloned."""
+    """Clone the repository if not already cloned, or clean up existing clone."""
     if os.path.exists(clone_path):
         logging.info(f"Repository '{repo_url}' already cloned at '{clone_path}'.")
         try:
@@ -136,19 +280,26 @@ def clone_repo(repo_url, clone_path):
             if repo.bare:
                 logging.error(f"Repository at '{clone_path}' is bare. Expected a non-bare repository.")
                 return None
+            
+            # Clean up the existing repository
+            cleanup_existing_repo(repo)
             return repo
+            
         except git.exc.InvalidGitRepositoryError:
-            logging.error(f"Directory '{clone_path}' is not a valid Git repository.")
-            return None
-    else:
-        logging.info(f"Cloning repository '{repo_url}' into '{clone_path}'...")
-        try:
-            repo = Repo.clone_from(repo_url, clone_path)
-            logging.debug(f"Cloned '{repo_url}' successfully.")
-            return repo
-        except GitCommandError as e:
-            logging.error(f"Failed to clone repository '{repo_url}': {e}")
-            return None
+            logging.warning(f"Directory '{clone_path}' is not a valid Git repository. Removing and re-cloning.")
+            import shutil
+            shutil.rmtree(clone_path)
+            # Fall through to clone fresh
+            
+    # Clone fresh repository
+    logging.info(f"Cloning repository '{repo_url}' into '{clone_path}'...")
+    try:
+        repo = Repo.clone_from(repo_url, clone_path)
+        logging.debug(f"Cloned '{repo_url}' successfully.")
+        return repo
+    except GitCommandError as e:
+        logging.error(f"Failed to clone repository '{repo_url}': {e}")
+        return None
 
 def parse_submodules(repo):
     """Parse submodules from a repository and return absolute URLs."""
@@ -225,30 +376,72 @@ def get_submodule_current_commit(repo, submodule):
     """Get the current commit hash of the submodule as recorded in the parent repo."""
     return submodule.hexsha
 
-def get_submodule_desired_commit(submodule_repo, desired_ref):
-    """Get the commit hash of the desired reference in the submodule."""
+def get_submodule_desired_commit(submodule_repo, desired_ref, submodule_url=None):
+    """Get the commit hash of the desired reference in the submodule.
+    
+    First tries to fetch from local filesystem if available, then falls back to origin.
+    """
+    # Try to use local filesystem remote first
+    local_remote_used = False
+    if submodule_url:
+        local_path = os.path.join(BASE_DIR, get_repo_name(submodule_url))
+        if os.path.exists(local_path):
+            try:
+                # Add temporary local remote
+                local_remote_name = 'local_temp'
+                if local_remote_name not in [r.name for r in submodule_repo.remotes]:
+                    submodule_repo.create_remote(local_remote_name, local_path)
+                    logging.debug(f"Added local remote '{local_remote_name}' pointing to '{local_path}'")
+                
+                # Fetch from local remote
+                submodule_repo.remotes[local_remote_name].fetch()
+                local_remote_used = True
+                logging.debug(f"Fetched from local remote for submodule '{get_repo_name(submodule_url)}'")
+                
+            except GitCommandError as e:
+                logging.warning(f"Could not use local remote for '{submodule_url}': {e}")
+                # Fall back to origin
+    
     try:
-        submodule_repo.remotes.origin.fetch()
+        # Fetch from origin if not using local remote
+        if not local_remote_used:
+            submodule_repo.remotes.origin.fetch()
+        
         # Check if ref exists as a local branch
         if is_branch(desired_ref, submodule_repo):
             submodule_repo.git.checkout(desired_ref)
-            submodule_repo.remotes.origin.pull()
+            if not local_remote_used:
+                submodule_repo.remotes.origin.pull()
             desired_commit = submodule_repo.head.commit.hexsha
             return desired_commit
-        # Check if ref exists as a remote branch
+            
+        # Check if ref exists as a remote branch (try local_temp first if available)
+        if local_remote_used:
+            try:
+                remote_branch = f"local_temp/{desired_ref}"
+                submodule_repo.git.checkout('-b', desired_ref, remote_branch)
+                desired_commit = submodule_repo.head.commit.hexsha
+                return desired_commit
+            except GitCommandError:
+                pass
+        
+        # Try origin remote branch
         try:
             remote_branch = f"origin/{desired_ref}"
             submodule_repo.git.checkout('-b', desired_ref, remote_branch)
-            submodule_repo.remotes.origin.pull()
+            if not local_remote_used:
+                submodule_repo.remotes.origin.pull()
             desired_commit = submodule_repo.head.commit.hexsha
             return desired_commit
         except GitCommandError:
             pass
+            
         # Check if ref exists as a tag
         if desired_ref in [tag.name for tag in submodule_repo.tags]:
             submodule_repo.git.checkout(desired_ref)
             desired_commit = submodule_repo.head.commit.hexsha
             return desired_commit
+            
         # Attempt to resolve as a commit hash
         try:
             desired_commit = submodule_repo.commit(desired_ref).hexsha
@@ -257,9 +450,18 @@ def get_submodule_desired_commit(submodule_repo, desired_ref):
         except (git.BadName, ValueError):
             logging.error(f"Reference '{desired_ref}' does not exist in submodule '{get_repo_name(submodule_repo.working_tree_dir)}'.")
             return None
+            
     except GitCommandError as e:
         logging.error(f"Error fetching or checking out '{desired_ref}' in submodule '{get_repo_name(submodule_repo.working_tree_dir)}': {e}")
         return None
+    finally:
+        # Clean up temporary local remote if it was added
+        if local_remote_used and 'local_temp' in [r.name for r in submodule_repo.remotes]:
+            try:
+                submodule_repo.delete_remote('local_temp')
+                logging.debug(f"Removed temporary local remote")
+            except GitCommandError:
+                pass
 
 def is_branch(ref, repo):
     """Check if the reference is a branch in the repository."""
@@ -272,6 +474,95 @@ def is_branch(ref, repo):
 def is_remote_branch(ref, repo):
     """Check if the reference exists as a remote branch."""
     return any(r.name.split('/')[-1] == ref for r in repo.remotes.origin.refs)
+
+def validate_yaml_operations(config):
+    """Pre-validate all YAML file operations to ensure they will succeed."""
+    errors = []
+    warnings = []
+    
+    for repo_url, settings in config.items():
+        update_yaml_entries = settings.get('update_yaml', [])
+        if not update_yaml_entries:
+            continue
+            
+        clone_path = os.path.join(BASE_DIR, get_repo_name(repo_url))
+        if not os.path.exists(clone_path):
+            # This will be cloned later, skip validation for now
+            warnings.append(f"Repository '{repo_url}' not yet cloned, YAML validation skipped")
+            continue
+            
+        for edit in update_yaml_entries:
+            yaml_path = os.path.join(clone_path, edit['filename'])
+            
+            # Check if file exists
+            if not os.path.exists(yaml_path):
+                errors.append(f"YAML file '{edit['filename']}' not found in repository '{repo_url}'")
+                continue
+                
+            # Try to load and validate the YAML file
+            try:
+                yaml_obj = YAML()
+                yaml_obj.preserve_quotes = True
+                with open(yaml_path, 'r') as f:
+                    data = yaml_obj.load(f)
+                    
+                # Validate key path exists
+                key_to_update = edit['key_to_update']
+                keys = key_to_update.split('.')
+                current = data
+                
+                try:
+                    for key in keys[:-1]:
+                        if '[' in key and ']' in key:
+                            # Parse conditional access
+                            list_key, condition = key.split('[', 1)
+                            condition = condition.rstrip(']')
+                            field, value = condition.split('=', 1)
+                            
+                            if list_key not in current or not isinstance(current[list_key], list):
+                                errors.append(f"Key '{list_key}' is not a list in YAML file '{edit['filename']}' in repository '{repo_url}'")
+                                raise KeyError
+                                
+                            # Find matching item
+                            matched_item = None
+                            for item in current[list_key]:
+                                if isinstance(item, dict) and item.get(field) == value:
+                                    matched_item = item
+                                    break
+                                    
+                            if not matched_item:
+                                errors.append(f"No item found in list '{list_key}' with condition '{field}={value}' in YAML file '{edit['filename']}' in repository '{repo_url}'")
+                                raise KeyError
+                                
+                            current = matched_item
+                        else:
+                            if key not in current:
+                                errors.append(f"Key '{key}' not found in path '{key_to_update}' in YAML file '{edit['filename']}' in repository '{repo_url}'")
+                                raise KeyError
+                            current = current[key]
+                            
+                    # Check last key exists
+                    last_key = keys[-1]
+                    if last_key not in current:
+                        warnings.append(f"Key '{last_key}' not found in path '{key_to_update}' in YAML file '{edit['filename']}' in repository '{repo_url}' (will be created)")
+                        
+                except KeyError:
+                    # Error already added above
+                    pass
+                    
+            except Exception as e:
+                errors.append(f"Failed to validate YAML file '{edit['filename']}' in repository '{repo_url}': {e}")
+                
+    if errors:
+        for error in errors:
+            logging.error(error)
+        return False, errors, warnings
+    else:
+        if warnings:
+            for warning in warnings:
+                logging.warning(warning)
+        logging.info("YAML validation passed")
+        return True, errors, warnings
 
 def validate_refs(config, tag=None):
     """Validate that all refs in the config are valid."""
@@ -381,7 +672,7 @@ def create_merge_request(repo, source_branch, target_branch, automerge=False):
         push_options.append('merge_request.merge_when_pipeline_succeeds=true')
     return push_options
 
-def update_repo(repo_url, desired_ref, config, tag=None, retag=False, dry_run=False, updated_repos_branches=None):
+def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabled=False, updated_repos_branches=None):
     """
     Update a single repository and its submodules.
 
@@ -391,22 +682,32 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, dry_run=Fa
         config (dict): The configuration dictionary loaded from repos.yaml.
         tag (str, optional): The name of the Git tag to create. Defaults to None.
         retag (bool, optional): Whether to overwrite existing tags. Defaults to False.
-        dry_run (bool, optional): If True, perform a dry run without making changes. Defaults to False.
+        push_enabled (bool, optional): If True, push changes to remote. If False, only process locally. Defaults to False.
         updated_repos_branches (dict, optional): A mapping of repository URLs to their updated feature branch names.
                                                  Defaults to None.
+    
+    Returns:
+        RepoOperationResult: The result of the operation.
     """
     if updated_repos_branches is None:
         updated_repos_branches = {}
 
+    result = RepoOperationResult(repo_url=repo_url)
+    
     clone_path = os.path.join(BASE_DIR, get_repo_name(repo_url))
     repo = clone_repo(repo_url, clone_path)
 
     if repo is None:
         logging.error(f"Skipping repository '{repo_url}' due to cloning issues.")
-        return
+        result.success = False
+        result.error_message = "Failed to clone repository"
+        return result
+        
+    result.repo_object = repo
 
     # Retrieve repository-specific settings
     settings = config.get(repo_url, {})
+    result.settings = settings  # Store settings for Phase 2
     ref_from_dir = settings.get('ref_from_dir')
     automerge = settings.get('automerge', False)
     create_mr = settings.get('create_merge_request', True)
@@ -428,38 +729,46 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, dry_run=Fa
 
     # Identify submodule updates
     updated_submodules, submodule_commits = identify_submodule_updates(repo, config, updated_repos_branches)
+    result.submodules_updated = updated_submodules
 
     if updated_submodules:
-        # Create a feature branch for the updates
-        branch_name = create_feature_branch(repo, repo_url, tag, dry_run)
+        # Create a feature branch for the updates (always create in Phase 1)
+        branch_name = create_feature_branch(repo, repo_url, tag, push_enabled=False)  # Never skip branch creation
+        result.branch_name = branch_name
 
-        if branch_name is None and dry_run:
-            # In dry run, skip further actions
-            pass
-        else:
+        if branch_name:
             # Collect YAML file updates based on submodule updates
             updated_yaml_files = collect_yaml_updates(settings, updated_submodules)
+            result.yaml_files_updated = updated_yaml_files
 
             # Process YAML file updates
             if updated_yaml_files:
-                process_yaml_updates(clone_path, updated_yaml_files, submodule_commits, dry_run)
+                process_yaml_updates(clone_path, updated_yaml_files, submodule_commits, dry_run=not push_enabled)
 
             # Commit the submodule updates
             commit_changes(repo, repo_url, updated_submodules)
 
-            # Push the feature branch and create a merge request if applicable
-            push_branch(repo, repo_url, branch_name, settings, automerge, create_mr, dry_run)
-
-            if not dry_run:
+            # Only push if in Phase 2
+            if push_enabled:
+                push_branch(repo, repo_url, branch_name, settings, automerge, create_mr, dry_run=False)
                 # Record the branch to update parent repositories
                 updated_repos_branches[repo_url] = branch_name
                 logging.debug(f"Recorded updated branch '{branch_name}' for repository '{repo_url}' in 'updated_repos_branches'.")
+            else:
+                logging.info(f"Phase 1: Created branch '{branch_name}' locally, not pushing yet")
 
-    # Handle tagging
-    handle_tagging(repo, repo_url, tag, retag, dry_run)
+    # Handle tagging (only in Phase 2)
+    if push_enabled and tag:
+        handle_tagging(repo, repo_url, tag, retag, dry_run=False)
+        result.tag_to_create = tag
+    elif tag:
+        logging.info(f"Phase 1: Tag '{tag}' will be created in Phase 2")
+        result.tag_to_create = tag
 
     # Log a summary of the commits
-    log_commit_summary(repo_url, updated_submodules, updated_yaml_files, dry_run)
+    log_commit_summary(repo_url, updated_submodules, updated_yaml_files, dry_run=not push_enabled)
+    
+    return result
 
 def get_desired_ref(repo, repo_url, ref_from_dir, desired_ref):
     """Determine the desired reference to checkout."""
@@ -548,8 +857,8 @@ def identify_submodule_updates(repo, config, updated_repos_branches):
                 logging.error(f"Desired ref is None for submodule '{get_repo_name(resolved_sub_url)}'. Skipping.")
                 continue
 
-            # Get the desired commit hash
-            desired_commit = get_submodule_desired_commit(submodule.module(), desired_ref_submodule)
+            # Get the desired commit hash (pass submodule URL for local remote support)
+            desired_commit = get_submodule_desired_commit(submodule.module(), desired_ref_submodule, resolved_sub_url)
             logging.debug(f"Desired commit for submodule '{get_repo_name(resolved_sub_url)}' is {desired_commit}")
 
             if desired_commit is None:
@@ -597,11 +906,13 @@ def determine_submodule_ref(submodule, config, updated_repos_branches, parent_re
             desired_ref_submodule = sub_settings.get('ref')
     return desired_ref_submodule
 
-def create_feature_branch(repo, repo_url, tag, dry_run):
-    """Create a new feature branch for committing the updates."""
-    if dry_run:
-        logging.info("Dry run enabled. Branch creation skipped.")
-        return None
+def create_feature_branch(repo, repo_url, tag, push_enabled):
+    """Create a new feature branch for committing the updates.
+    
+    Args:
+        push_enabled: If False, we're in Phase 1 (local only). If True, we're in Phase 2.
+    """
+    # Always create branches locally in Phase 1
 
     # Fetch all remote branches to ensure up-to-date information
     try:
@@ -724,13 +1035,24 @@ def handle_tagging(repo, repo_url, tag, retag, dry_run):
                 logging.info(f"Dry run: Would delete existing tag '{tag}' in '{get_repo_name(repo_url)}'.")
             else:
                 logging.info(f"Deleting existing tag '{tag}' in '{get_repo_name(repo_url)}' as '--retag' is specified.")
+                
+                # Delete local tag
                 try:
                     repo.delete_tag(tag)
-                    repo.remotes.origin.push(refspec=f":refs/tags/{tag}")  # Delete remote tag
-                    logging.debug(f"Deleted tag '{tag}' locally and remotely in '{get_repo_name(repo_url)}'.")
+                    logging.debug(f"Deleted local tag '{tag}'")
                 except GitCommandError as e:
-                    logging.error(f"Failed to delete existing tag '{tag}' in '{repo_url}': {e}")
-                    sys.exit(1)
+                    logging.warning(f"Could not delete local tag '{tag}': {e}")
+                
+                # Try to delete remote tag via Git first
+                try:
+                    repo.remotes.origin.push(refspec=f":refs/tags/{tag}")
+                    logging.debug(f"Deleted remote tag '{tag}' via Git")
+                except GitCommandError as e:
+                    # If Git push fails (likely protected tag), try API
+                    logging.info(f"Failed to delete tag via Git, trying GitLab API: {e}")
+                    if not delete_gitlab_tag_via_api(repo_url, tag):
+                        logging.error(f"Failed to delete protected tag '{tag}'. Please delete manually or provide GITLAB_TOKEN")
+                        sys.exit(1)
         else:
             logging.error(f"Tag '{tag}' already exists in '{repo_url}'. Use '--retag' to overwrite.")
             sys.exit(1)
@@ -856,20 +1178,131 @@ def update_yaml_files(clone_path, update_yaml_entries, submodule_commits, dry_ru
             logging.error(f"Failed to save updated YAML file '{yaml_path}': {e}")
             continue
 
+def run_cleanup(config, tag=None):
+    """Clean up branches, tags, and MRs from a previous failed run."""
+    logging.info("Running cleanup mode...")
+    
+    for repo_url in config.keys():
+        clone_path = os.path.join(BASE_DIR, get_repo_name(repo_url))
+        if not os.path.exists(clone_path):
+            logging.debug(f"Repository '{repo_url}' not cloned, skipping cleanup")
+            continue
+            
+        try:
+            repo = Repo(clone_path)
+            
+            # Delete local update-submodules branches
+            for branch in repo.heads:
+                if 'update-submodules' in branch.name:
+                    if branch != repo.active_branch:
+                        try:
+                            repo.delete_head(branch, force=True)
+                            logging.info(f"Deleted local branch '{branch.name}' in '{get_repo_name(repo_url)}'")
+                        except GitCommandError as e:
+                            logging.warning(f"Could not delete local branch '{branch.name}': {e}")
+            
+            # Delete remote update-submodules branches
+            repo.remotes.origin.fetch()
+            for ref in repo.remotes.origin.refs:
+                if 'update-submodules' in ref.remote_head:
+                    try:
+                        repo.remotes.origin.push(refspec=f":{ref.remote_head}")
+                        logging.info(f"Deleted remote branch '{ref.remote_head}' in '{get_repo_name(repo_url)}'")
+                    except GitCommandError as e:
+                        logging.warning(f"Could not delete remote branch '{ref.remote_head}': {e}")
+            
+            # Delete specified tag if provided
+            if tag:
+                # Delete local tag
+                if tag in [t.name for t in repo.tags]:
+                    try:
+                        repo.delete_tag(tag)
+                        logging.info(f"Deleted local tag '{tag}' in '{get_repo_name(repo_url)}'")
+                    except GitCommandError as e:
+                        logging.warning(f"Could not delete local tag '{tag}': {e}")
+                
+                # Delete remote tag (try Git first, then API)
+                try:
+                    repo.remotes.origin.push(refspec=f":refs/tags/{tag}")
+                    logging.info(f"Deleted remote tag '{tag}' in '{get_repo_name(repo_url)}'")
+                except GitCommandError:
+                    # Try API for protected tags
+                    if delete_gitlab_tag_via_api(repo_url, tag):
+                        logging.info(f"Deleted protected tag '{tag}' via API in '{get_repo_name(repo_url)}'")
+                    else:
+                        logging.warning(f"Could not delete remote tag '{tag}' in '{get_repo_name(repo_url)}'")
+                        
+        except Exception as e:
+            logging.error(f"Error during cleanup of '{repo_url}': {e}")
+            
+    logging.info("Cleanup completed")
+
+def push_all_operations(operations, sorted_repos):
+    """Phase 2: Push all operations to remote in topological order."""
+    logging.info("=" * 60)
+    logging.info("PHASE 2: Pushing all changes to remote repositories")
+    logging.info("=" * 60)
+    
+    push_failures = []
+    
+    # Push in topological order to ensure dependencies are available
+    for repo_url in sorted_repos:
+        if repo_url not in operations:
+            continue
+            
+        operation = operations[repo_url]
+        if not operation.success or not operation.branch_name:
+            continue
+            
+        logging.info(f"Pushing changes for '{get_repo_name(repo_url)}'...")
+        
+        try:
+            repo = operation.repo_object
+            settings = operation.settings
+            
+            # Push the branch and create MR
+            if operation.branch_name:
+                automerge = settings.get('automerge', False)
+                create_mr = settings.get('create_merge_request', True)
+                push_branch(repo, repo_url, operation.branch_name, settings, automerge, create_mr, dry_run=False)
+            
+            # Create and push tag
+            if operation.tag_to_create:
+                handle_tagging(repo, repo_url, operation.tag_to_create, retag=True, dry_run=False)
+                
+        except Exception as e:
+            logging.error(f"Failed to push changes for '{repo_url}': {e}")
+            push_failures.append(repo_url)
+            
+    if push_failures:
+        logging.error(f"Failed to push changes for the following repositories: {push_failures}")
+        logging.error("You may need to manually push these or run with --cleanup to reset")
+        return False
+    else:
+        logging.info("All changes pushed successfully!")
+        return True
+
 def main():
     """Main function to orchestrate the update process."""
     args = parse_arguments()
     setup_logging(args.log_level)
     logging.debug("Starting the repository update process.")
+    
+    # Load and validate configuration
+    config = load_config(CONFIG_FILE)
+    validate_config(config)
+    
+    # Handle cleanup mode
+    if args.cleanup:
+        run_cleanup(config, args.cleanup_tag)
+        sys.exit(0)
 
     if not os.path.exists(BASE_DIR):
         os.makedirs(BASE_DIR)
         logging.debug(f"Created base directory '{BASE_DIR}' for cloning repositories.")
 
-    config = load_config(CONFIG_FILE)
-    validate_config(config)
-    validate_refs(config, tag=args.tag)  # Pass the tag argument here
-
+    # Validate refs and build dependency graph
+    validate_refs(config, tag=args.tag)
     dependency_graph = build_dependency_graph(config)
     sorted_repos = topological_sort(dependency_graph)
     # Reverse the sorted list to process submodules first
@@ -879,30 +1312,84 @@ def main():
     for repo_url in sorted_repos:
         logging.info(f"- {get_repo_name(repo_url)}")
 
+    # ========================================================================
+    # PHASE 1: Local Processing and Validation
+    # ========================================================================
+    logging.info("=" * 60)
+    logging.info("PHASE 1: Local processing and validation")
+    logging.info("=" * 60)
+    
+    # Validate YAML operations before starting
+    yaml_valid, yaml_errors, yaml_warnings = validate_yaml_operations(config)
+    if not yaml_valid:
+        logging.error("YAML validation failed. Please fix the errors above and try again.")
+        sys.exit(1)
+    
     # Initialize a mapping to track repositories updated via branches
     updated_repos_branches = {}
+    operations = {}
 
     for repo_url in sorted_repos:
         settings = config.get(repo_url, {})
         if not settings:
             logging.error(f"No settings found for repository '{repo_url}'. Skipping.")
             continue
+            
         tag = args.tag
         retag = args.retag
         desired_ref = settings.get('ref') if 'ref' in settings else None
         desired_ref_from_dir = settings.get('ref_from_dir') if 'ref_from_dir' in settings else None
-        logging.info(f"\nUpdating repository '{get_repo_name(repo_url)}' to '{desired_ref if desired_ref else 'ref_from_dir'}'...")
-        update_repo(
+        
+        logging.info(f"\nProcessing repository '{get_repo_name(repo_url)}' to '{desired_ref if desired_ref else 'ref_from_dir'}'...")
+        
+        # Phase 1: Process locally only
+        result = update_repo(
             repo_url=repo_url,
             desired_ref=desired_ref,
             config=config,
             tag=tag,
             retag=retag,
-            dry_run=args.dry_run,
+            push_enabled=False,  # Phase 1: local only
             updated_repos_branches=updated_repos_branches
         )
-
-    logging.debug("Repository update process completed.")
+        
+        operations[repo_url] = result
+        
+        if not result.success:
+            logging.error(f"Failed to process repository '{repo_url}': {result.error_message}")
+            logging.error("Stopping due to error in Phase 1. No changes pushed to remote.")
+            sys.exit(1)
+    
+    # If dry-run, stop here (Phase 1 only)
+    if args.dry_run:
+        logging.info("=" * 60)
+        logging.info("DRY RUN COMPLETE - No changes pushed to remote")
+        logging.info("=" * 60)
+        logging.info("\nSummary of changes that would be made:")
+        for repo_url, operation in operations.items():
+            if operation.branch_name or operation.tag_to_create:
+                logging.info(f"\n{get_repo_name(repo_url)}:")
+                if operation.branch_name:
+                    logging.info(f"  - Would push branch: {operation.branch_name}")
+                if operation.submodules_updated:
+                    for sub_url, sub_details in operation.submodules_updated.items():
+                        logging.info(f"  - Would update submodule: {sub_details['name']}")
+                if operation.tag_to_create:
+                    logging.info(f"  - Would create tag: {operation.tag_to_create}")
+        sys.exit(0)
+    
+    # ========================================================================
+    # PHASE 2: Push to Remote (in topological order)
+    # ========================================================================
+    success = push_all_operations(operations, sorted_repos)
+    
+    if success:
+        logging.info("=" * 60)
+        logging.info("Repository update process completed successfully!")
+        logging.info("=" * 60)
+    else:
+        logging.error("Some operations failed. See errors above.")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
