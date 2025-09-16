@@ -755,9 +755,9 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
             updated_yaml_files = collect_yaml_updates(settings, updated_submodules)
             result.yaml_files_updated = updated_yaml_files
 
-            # Process YAML file updates
+            # Process YAML file updates (always process in Phase 1)
             if updated_yaml_files:
-                process_yaml_updates(clone_path, updated_yaml_files, submodule_commits, dry_run=not push_enabled)
+                process_yaml_updates(clone_path, updated_yaml_files, submodule_commits)
 
             # Commit the submodule updates
             commit_changes(repo, repo_url, updated_submodules)
@@ -771,16 +771,20 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
             else:
                 logging.info(f"Phase 1: Created branch '{branch_name}' locally, not pushing yet")
 
-    # Handle tagging (only in Phase 2)
-    if push_enabled and tag:
-        handle_tagging(repo, repo_url, tag, retag, dry_run=False)
-        result.tag_to_create = tag
-    elif tag:
-        logging.info(f"Phase 1: Tag '{tag}' will be created in Phase 2")
+    # Handle tagging
+    if tag:
+        # Always create tag locally in Phase 1 (to catch conflicts early)
+        create_tag_locally(repo, repo_url, tag, retag)
         result.tag_to_create = tag
 
+        if push_enabled:
+            # Phase 2: Push the tag to remote
+            push_tag(repo, repo_url, tag)
+        else:
+            logging.info(f"Phase 1: Tag '{tag}' created locally, will push in Phase 2")
+
     # Log a summary of the commits
-    log_commit_summary(repo_url, updated_submodules, updated_yaml_files, dry_run=not push_enabled)
+    log_commit_summary(repo_url, updated_submodules, updated_yaml_files, push_enabled)
     
     return result
 
@@ -1040,67 +1044,97 @@ def collect_yaml_updates(current_repo_settings, updated_submodules):
             })
     return updated_yaml_files
 
-def process_yaml_updates(clone_path, updated_yaml_files, submodule_commits, dry_run):
+def process_yaml_updates(clone_path, updated_yaml_files, submodule_commits):
     """Process YAML file updates."""
     for filename, edits in updated_yaml_files.items():
-        update_yaml_files(clone_path, edits, submodule_commits, dry_run=dry_run)
-        # Stage the updated YAML file
-        if not dry_run:
-            try:
-                repo = Repo(clone_path)
-                repo.git.add(filename)
-                logging.debug(f"Staged YAML file '{filename}' for commit.")
-            except GitCommandError as e:
-                logging.error(f"Failed to stage YAML file '{filename}': {e}")
-                continue
+        update_yaml_files(clone_path, edits, submodule_commits)
+        # Always stage the updated YAML file (Phase 1 operation)
+        try:
+            repo = Repo(clone_path)
+            repo.git.add(filename)
+            logging.debug(f"Staged YAML file '{filename}' for commit.")
+        except GitCommandError as e:
+            logging.error(f"Failed to stage YAML file '{filename}': {e}")
+            continue
 
-def handle_tagging(repo, repo_url, tag, retag, dry_run):
-    """Handle tagging of the repository."""
+def create_tag_locally(repo, repo_url, tag, retag):
+    """Create a tag locally (Phase 1 operation)."""
     if not tag:
         return
 
     existing_tags = [t.name for t in repo.tags]
     if tag in existing_tags:
         if retag:
-            if dry_run:
-                logging.info(f"Dry run: Would delete existing tag '{tag}' in '{get_repo_name(repo_url)}'.")
-            else:
-                logging.info(f"Deleting existing tag '{tag}' in '{get_repo_name(repo_url)}' as '--retag' is specified.")
-                
-                # Delete local tag
-                try:
-                    repo.delete_tag(tag)
-                    logging.debug(f"Deleted local tag '{tag}'")
-                except GitCommandError as e:
-                    logging.warning(f"Could not delete local tag '{tag}': {e}")
-                
-                # Try to delete remote tag via Git first
-                try:
-                    repo.remotes.origin.push(refspec=f":refs/tags/{tag}")
-                    logging.debug(f"Deleted remote tag '{tag}' via Git")
-                except GitCommandError as e:
-                    # If Git push fails (likely protected tag), try API
-                    logging.info(f"Failed to delete tag via Git, trying GitLab API: {e}")
-                    if not delete_gitlab_tag_via_api(repo_url, tag):
-                        logging.error(f"Failed to delete protected tag '{tag}'. Please delete manually or provide GITLAB_TOKEN")
-                        sys.exit(1)
+            logging.info(f"Deleting existing local tag '{tag}' in '{get_repo_name(repo_url)}' as '--retag' is specified.")
+
+            # Delete local tag
+            try:
+                repo.delete_tag(tag)
+                logging.debug(f"Deleted local tag '{tag}'")
+            except GitCommandError as e:
+                logging.warning(f"Could not delete local tag '{tag}': {e}")
         else:
             logging.error(f"Tag '{tag}' already exists in '{repo_url}'. Use '--retag' to overwrite.")
             sys.exit(1)
 
-    # Create the tag
-    if dry_run:
-        logging.info(f"Dry run: Would create tag '{tag}' in '{get_repo_name(repo_url)}' at commit '{repo.head.commit.hexsha}'.")
-    else:
-        try:
-            repo.create_tag(tag, message=f"Release {tag}", force=retag)
-            repo.remotes.origin.push(tag)
-            logging.info(f"Created and pushed tag '{tag}' in '{get_repo_name(repo_url)}'.")
-        except GitCommandError as e:
-            logging.error(f"Failed to create or push tag '{tag}' in '{repo_url}': {e}")
+    # Create the tag locally
+    try:
+        repo.create_tag(tag, message=f"Release {tag}", force=retag)
+        logging.debug(f"Created tag '{tag}' locally in '{get_repo_name(repo_url)}' at commit '{repo.head.commit.hexsha}'.")
+    except GitCommandError as e:
+        logging.error(f"Failed to create tag '{tag}' in '{repo_url}': {e}")
+        sys.exit(1)
+
+def push_tag(repo, repo_url, tag):
+    """Push a tag to remote (Phase 2 operation)."""
+    if not tag:
+        return
+
+    # Check if remote tag needs to be deleted first (for retag)
+    try:
+        # Try to push the tag
+        repo.remotes.origin.push(tag)
+        logging.info(f"Pushed tag '{tag}' to '{repo_url}'.")
+    except GitCommandError as e:
+        # If push fails, it might be because the tag already exists on remote
+        if "already exists" in str(e) or "cannot lock ref" in str(e):
+            logging.info(f"Tag '{tag}' already exists on remote, attempting to delete and repush...")
+
+            # Try to delete remote tag via Git first
+            try:
+                repo.remotes.origin.push(refspec=f":refs/tags/{tag}")
+                logging.debug(f"Deleted remote tag '{tag}' via Git")
+
+                # Now try to push again
+                repo.remotes.origin.push(tag)
+                logging.info(f"Pushed tag '{tag}' to '{repo_url}' after deleting existing remote tag.")
+            except GitCommandError as delete_error:
+                # If Git push fails (likely protected tag), try API
+                logging.info(f"Failed to delete tag via Git, trying GitLab API: {delete_error}")
+                if delete_gitlab_tag_via_api(repo_url, tag):
+                    # Try to push again after API deletion
+                    try:
+                        repo.remotes.origin.push(tag)
+                        logging.info(f"Pushed tag '{tag}' to '{repo_url}' after deleting via API.")
+                    except GitCommandError as push_error:
+                        logging.error(f"Failed to push tag '{tag}' even after deletion: {push_error}")
+                        sys.exit(1)
+                else:
+                    logging.error(f"Failed to delete protected tag '{tag}'. Please delete manually or provide GITLAB_TOKEN")
+                    sys.exit(1)
+        else:
+            logging.error(f"Failed to push tag '{tag}' to '{repo_url}': {e}")
             sys.exit(1)
 
-def log_commit_summary(repo_url, updated_submodules, updated_yaml_files, dry_run):
+def handle_tagging(repo, repo_url, tag, retag, dry_run):
+    """Legacy function for compatibility - redirects to new functions."""
+    # This function is still called from push_all_operations
+    if dry_run:
+        logging.info(f"Would push tag '{tag}' to '{repo_url}'")
+    else:
+        push_tag(repo, repo_url, tag)
+
+def log_commit_summary(repo_url, updated_submodules, updated_yaml_files, push_enabled):
     """Log a summary of the commits."""
     if not updated_submodules and not updated_yaml_files:
         logging.info(f"No submodule or YAML file updates to commit in '{get_repo_name(repo_url)}'.")
@@ -1123,12 +1157,12 @@ def log_commit_summary(repo_url, updated_submodules, updated_yaml_files, dry_run
     commit_message = "\n".join(commit_lines)
     logging.info(f"Commit summary for '{get_repo_name(repo_url)}':\n{commit_message}")
 
-    if dry_run:
-        logging.info("Dry run enabled. Commit and push actions were skipped.")
+    if not push_enabled:
+        logging.info("Phase 1: Local changes committed, will push in Phase 2")
     else:
-        logging.info("Commit and push actions have been completed.")
+        logging.info("Phase 2: Changes pushed to remote")
 
-def update_yaml_files(clone_path, update_yaml_entries, submodule_commits, dry_run=False):
+def update_yaml_files(clone_path, update_yaml_entries, submodule_commits):
     """Update specified YAML files with new submodule commit hashes."""
     yaml_obj = YAML()
     yaml_obj.preserve_quotes = True  # Preserve existing quotes
@@ -1197,10 +1231,7 @@ def update_yaml_files(clone_path, update_yaml_entries, submodule_commits, dry_ru
         current[last_key] = new_commit
         logging.debug(f"Updated '{key_to_update}' from '{old_value}' to '{new_commit}'.")
 
-        # Save the YAML file
-        if dry_run:
-            logging.info(f"Dry run: Would save updated YAML file '{yaml_path}'.")
-            continue
+        # Save the YAML file (always save in Phase 1)
         try:
             with open(yaml_path, 'w') as f:
                 yaml_obj.dump(data, f)
@@ -1297,9 +1328,9 @@ def push_all_operations(operations, sorted_repos):
                 create_mr = settings.get('create_merge_request', True)
                 push_branch(repo, repo_url, operation.branch_name, settings, automerge, create_mr, dry_run=False)
             
-            # Create and push tag
+            # Push tag (already created locally in Phase 1)
             if operation.tag_to_create:
-                handle_tagging(repo, repo_url, operation.tag_to_create, retag=True, dry_run=False)
+                push_tag(repo, repo_url, operation.tag_to_create)
                 
         except Exception as e:
             logging.error(f"Failed to push changes for '{repo_url}': {e}")
