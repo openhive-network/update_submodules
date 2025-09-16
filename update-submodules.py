@@ -882,6 +882,8 @@ def identify_submodule_updates(repo, config, updated_repos_branches):
                 logging.debug(f"Submodule '{get_repo_name(resolved_sub_url)}' has local changes, will use local remote")
             else:
                 logging.debug(f"Submodule '{get_repo_name(resolved_sub_url)}' has no local changes, will use origin")
+                logging.debug(f"  resolved_sub_url: {resolved_sub_url}")
+                logging.debug(f"  updated_repos_branches keys: {list(updated_repos_branches.keys())}")
 
             desired_commit = get_submodule_desired_commit(
                 submodule.module(),
