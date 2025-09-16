@@ -762,12 +762,14 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
             # Commit the submodule updates
             commit_changes(repo, repo_url, updated_submodules)
 
+            # Record the branch to update parent repositories
+            # This must happen in Phase 1 so dependent repos can use the branch
+            updated_repos_branches[repo_url] = branch_name
+            logging.debug(f"Recorded updated branch '{branch_name}' for repository '{repo_url}' in 'updated_repos_branches'.")
+
             # Only push if in Phase 2
             if push_enabled:
                 push_branch(repo, repo_url, branch_name, settings, automerge, create_mr, dry_run=False)
-                # Record the branch to update parent repositories
-                updated_repos_branches[repo_url] = branch_name
-                logging.debug(f"Recorded updated branch '{branch_name}' for repository '{repo_url}' in 'updated_repos_branches'.")
             else:
                 logging.info(f"Phase 1: Created branch '{branch_name}' locally, not pushing yet")
 
@@ -1315,21 +1317,25 @@ def push_all_operations(operations, sorted_repos):
             continue
             
         operation = operations[repo_url]
-        if not operation.success or not operation.branch_name:
+        if not operation.success:
             continue
-            
+
+        # Skip if no branch and no tag to push
+        if not operation.branch_name and not operation.tag_to_create:
+            continue
+
         logging.info(f"Pushing changes for '{get_repo_name(repo_url)}'...")
-        
+
         try:
             repo = operation.repo_object
             settings = operation.settings
-            
+
             # Push the branch and create MR
             if operation.branch_name:
                 automerge = settings.get('automerge', False)
                 create_mr = settings.get('create_merge_request', True)
                 push_branch(repo, repo_url, operation.branch_name, settings, automerge, create_mr, dry_run=False)
-            
+
             # Push tag (already created locally in Phase 1)
             if operation.tag_to_create:
                 push_tag(repo, repo_url, operation.tag_to_create)
