@@ -1427,17 +1427,39 @@ def main():
         logging.info("=" * 60)
         logging.info("DRY RUN COMPLETE - No changes pushed to remote")
         logging.info("=" * 60)
-        logging.info("\nSummary of changes that would be made:")
+        logging.info("\nSummary of what would be pushed in Phase 2:")
+
         for repo_url, operation in operations.items():
+            settings = operation.settings
             if operation.branch_name or operation.tag_to_create:
                 logging.info(f"\n{get_repo_name(repo_url)}:")
+
+                # Branch and MR info
                 if operation.branch_name:
+                    create_mr = settings.get('create_merge_request', True)
+                    automerge = settings.get('automerge', False)
+                    target_branch = settings.get('target_branch', settings.get('ref', 'main'))
+
                     logging.info(f"  - Would push branch: {operation.branch_name}")
-                if operation.submodules_updated:
-                    for sub_url, sub_details in operation.submodules_updated.items():
-                        logging.info(f"  - Would update submodule: {sub_details['name']}")
+                    if create_mr:
+                        mr_desc = f"  - Would create MR to {target_branch}"
+                        if automerge:
+                            mr_desc += " (with auto-merge)"
+                        logging.info(mr_desc)
+
+                    # Show what's in the branch
+                    if operation.submodules_updated or operation.yaml_files_updated:
+                        logging.info("    Branch contains:")
+                        if operation.submodules_updated:
+                            for sub_url, sub_details in operation.submodules_updated.items():
+                                logging.info(f"      - Updated submodule: {sub_details['name']} to {sub_details['ref']}")
+                        if operation.yaml_files_updated:
+                            for filename in operation.yaml_files_updated.keys():
+                                logging.info(f"      - Modified YAML: {filename}")
+
+                # Tag info
                 if operation.tag_to_create:
-                    logging.info(f"  - Would create tag: {operation.tag_to_create}")
+                    logging.info(f"  - Would push tag: {operation.tag_to_create} (already created locally)")
         sys.exit(0)
     
     # ========================================================================
