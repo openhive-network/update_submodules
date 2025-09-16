@@ -378,29 +378,43 @@ def get_submodule_current_commit(repo, submodule):
 
 def get_submodule_desired_commit(submodule_repo, desired_ref, submodule_url=None):
     """Get the commit hash of the desired reference in the submodule.
-    
-    First tries to fetch from local filesystem if available, then falls back to origin.
+
+    Args:
+        submodule_repo: The submodule repository object
+        desired_ref: The reference to checkout (branch, tag, or commit)
+        submodule_url: If provided, indicates we MUST use local remote (for updated repos)
+
+    Returns:
+        The commit hash, or None if the reference cannot be found
     """
-    # Try to use local filesystem remote first
+    # If submodule_url is provided, we MUST use local remote (it has local commits)
     local_remote_used = False
-    if submodule_url:
-        local_path = os.path.join(BASE_DIR, get_repo_name(submodule_url))
-        if os.path.exists(local_path):
-            try:
-                # Add temporary local remote
-                local_remote_name = 'local_temp'
-                if local_remote_name not in [r.name for r in submodule_repo.remotes]:
-                    submodule_repo.create_remote(local_remote_name, local_path)
-                    logging.debug(f"Added local remote '{local_remote_name}' pointing to '{local_path}'")
-                
-                # Fetch from local remote
-                submodule_repo.remotes[local_remote_name].fetch()
-                local_remote_used = True
-                logging.debug(f"Fetched from local remote for submodule '{get_repo_name(submodule_url)}'")
-                
-            except GitCommandError as e:
-                logging.warning(f"Could not use local remote for '{submodule_url}': {e}")
-                # Fall back to origin
+    local_remote_required = submodule_url is not None
+
+    if local_remote_required:
+        # Use absolute path for local remote
+        local_path = os.path.abspath(os.path.join(BASE_DIR, get_repo_name(submodule_url)))
+        if not os.path.exists(local_path):
+            logging.error(f"Local repository required but not found at '{local_path}'")
+            logging.error(f"Cannot resolve dependency for submodule '{get_repo_name(submodule_url)}'")
+            return None
+
+        try:
+            # Add temporary local remote
+            local_remote_name = 'local_temp'
+            if local_remote_name not in [r.name for r in submodule_repo.remotes]:
+                submodule_repo.create_remote(local_remote_name, local_path)
+                logging.debug(f"Added local remote '{local_remote_name}' pointing to '{local_path}'")
+
+            # Fetch from local remote
+            submodule_repo.remotes[local_remote_name].fetch()
+            local_remote_used = True
+            logging.debug(f"Fetched from local remote for submodule '{get_repo_name(submodule_url)}'")
+
+        except GitCommandError as e:
+            logging.error(f"Failed to use required local remote for '{submodule_url}': {e}")
+            logging.error(f"This is required because '{get_repo_name(submodule_url)}' has local changes not yet pushed")
+            return None
     
     try:
         # Fetch from origin if not using local remote
@@ -858,12 +872,29 @@ def identify_submodule_updates(repo, config, updated_repos_branches):
                 continue
 
             # Get the desired commit hash (pass submodule URL for local remote support)
-            desired_commit = get_submodule_desired_commit(submodule.module(), desired_ref_submodule, resolved_sub_url)
+            # We need local remotes for submodules that have been updated locally
+            use_local_remote = resolved_sub_url in updated_repos_branches
+            if use_local_remote:
+                logging.debug(f"Submodule '{get_repo_name(resolved_sub_url)}' has local changes, will use local remote")
+            else:
+                logging.debug(f"Submodule '{get_repo_name(resolved_sub_url)}' has no local changes, will use origin")
+
+            desired_commit = get_submodule_desired_commit(
+                submodule.module(),
+                desired_ref_submodule,
+                resolved_sub_url if use_local_remote else None
+            )
             logging.debug(f"Desired commit for submodule '{get_repo_name(resolved_sub_url)}' is {desired_commit}")
 
             if desired_commit is None:
-                logging.error(f"Failed to determine desired commit for submodule '{get_repo_name(resolved_sub_url)}'.")
-                continue
+                if use_local_remote:
+                    # This is a critical failure - we needed local changes but couldn't get them
+                    logging.error(f"CRITICAL: Failed to get commit from local repository for submodule '{get_repo_name(resolved_sub_url)}'")
+                    logging.error("Cannot continue - local changes are required but not accessible")
+                    sys.exit(1)
+                else:
+                    logging.error(f"Failed to determine desired commit for submodule '{get_repo_name(resolved_sub_url)}'.")
+                    continue
 
             # Get the current commit hash of the submodule
             current_commit = get_submodule_current_commit(repo, submodule)
