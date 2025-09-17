@@ -1244,64 +1244,88 @@ def update_yaml_files(clone_path, update_yaml_entries, submodule_commits):
             logging.error(f"Failed to save updated YAML file '{yaml_path}': {e}")
             continue
 
-def run_cleanup(config, tag=None):
+def run_cleanup(config, tag=None, dry_run=False):
     """Clean up branches, tags, and MRs from a previous failed run."""
-    logging.info("Running cleanup mode...")
-    
+    if dry_run:
+        logging.info("Running cleanup mode (DRY RUN - no changes will be made)...")
+    else:
+        logging.info("Running cleanup mode...")
+
     for repo_url in config.keys():
         clone_path = os.path.join(BASE_DIR, get_repo_name(repo_url))
         if not os.path.exists(clone_path):
             logging.debug(f"Repository '{repo_url}' not cloned, skipping cleanup")
             continue
-            
+
         try:
             repo = Repo(clone_path)
-            
+
             # Delete local update-submodules branches
             for branch in repo.heads:
                 if 'update-submodules' in branch.name:
                     if branch != repo.active_branch:
-                        try:
-                            repo.delete_head(branch, force=True)
-                            logging.info(f"Deleted local branch '{branch.name}' in '{get_repo_name(repo_url)}'")
-                        except GitCommandError as e:
-                            logging.warning(f"Could not delete local branch '{branch.name}': {e}")
-            
+                        if dry_run:
+                            logging.info(f"Would delete local branch '{branch.name}' in '{get_repo_name(repo_url)}'")
+                        else:
+                            try:
+                                repo.delete_head(branch, force=True)
+                                logging.info(f"Deleted local branch '{branch.name}' in '{get_repo_name(repo_url)}'")
+                            except GitCommandError as e:
+                                logging.warning(f"Could not delete local branch '{branch.name}': {e}")
+
             # Delete remote update-submodules branches
             repo.remotes.origin.fetch()
             for ref in repo.remotes.origin.refs:
                 if 'update-submodules' in ref.remote_head:
-                    try:
-                        repo.remotes.origin.push(refspec=f":{ref.remote_head}")
-                        logging.info(f"Deleted remote branch '{ref.remote_head}' in '{get_repo_name(repo_url)}'")
-                    except GitCommandError as e:
-                        logging.warning(f"Could not delete remote branch '{ref.remote_head}': {e}")
-            
+                    if dry_run:
+                        logging.info(f"Would delete remote branch '{ref.remote_head}' in '{get_repo_name(repo_url)}'")
+                    else:
+                        try:
+                            repo.remotes.origin.push(refspec=f":{ref.remote_head}")
+                            logging.info(f"Deleted remote branch '{ref.remote_head}' in '{get_repo_name(repo_url)}'")
+                        except GitCommandError as e:
+                            logging.warning(f"Could not delete remote branch '{ref.remote_head}': {e}")
+
             # Delete specified tag if provided
             if tag:
                 # Delete local tag
                 if tag in [t.name for t in repo.tags]:
-                    try:
-                        repo.delete_tag(tag)
-                        logging.info(f"Deleted local tag '{tag}' in '{get_repo_name(repo_url)}'")
-                    except GitCommandError as e:
-                        logging.warning(f"Could not delete local tag '{tag}': {e}")
-                
-                # Delete remote tag (try Git first, then API)
-                try:
-                    repo.remotes.origin.push(refspec=f":refs/tags/{tag}")
-                    logging.info(f"Deleted remote tag '{tag}' in '{get_repo_name(repo_url)}'")
-                except GitCommandError:
-                    # Try API for protected tags
-                    if delete_gitlab_tag_via_api(repo_url, tag):
-                        logging.info(f"Deleted protected tag '{tag}' via API in '{get_repo_name(repo_url)}'")
+                    if dry_run:
+                        logging.info(f"Would delete local tag '{tag}' in '{get_repo_name(repo_url)}'")
                     else:
-                        logging.warning(f"Could not delete remote tag '{tag}' in '{get_repo_name(repo_url)}'")
-                        
+                        try:
+                            repo.delete_tag(tag)
+                            logging.info(f"Deleted local tag '{tag}' in '{get_repo_name(repo_url)}'")
+                        except GitCommandError as e:
+                            logging.warning(f"Could not delete local tag '{tag}': {e}")
+
+                # Delete remote tag (try Git first, then API)
+                if dry_run:
+                    # Check if tag exists on remote
+                    try:
+                        repo.remotes.origin.fetch(refspec=f"refs/tags/{tag}:refs/tags/{tag}", no_tags=True)
+                        logging.info(f"Would delete remote tag '{tag}' in '{get_repo_name(repo_url)}'")
+                    except GitCommandError:
+                        # Tag doesn't exist on remote, nothing to do
+                        pass
+                else:
+                    try:
+                        repo.remotes.origin.push(refspec=f":refs/tags/{tag}")
+                        logging.info(f"Deleted remote tag '{tag}' in '{get_repo_name(repo_url)}'")
+                    except GitCommandError:
+                        # Try API for protected tags
+                        if delete_gitlab_tag_via_api(repo_url, tag):
+                            logging.info(f"Deleted protected tag '{tag}' via API in '{get_repo_name(repo_url)}'")
+                        else:
+                            logging.warning(f"Could not delete remote tag '{tag}' in '{get_repo_name(repo_url)}'")
+
         except Exception as e:
             logging.error(f"Error during cleanup of '{repo_url}': {e}")
-            
-    logging.info("Cleanup completed")
+
+    if dry_run:
+        logging.info("Cleanup dry run completed - no changes were made")
+    else:
+        logging.info("Cleanup completed")
 
 def push_all_operations(operations, sorted_repos):
     """Phase 2: Push all operations to remote in topological order."""
@@ -1364,7 +1388,7 @@ def main():
     
     # Handle cleanup mode
     if args.cleanup:
-        run_cleanup(config, args.cleanup_tag)
+        run_cleanup(config, args.cleanup_tag, args.dry_run)
         sys.exit(0)
 
     if not os.path.exists(BASE_DIR):
