@@ -90,12 +90,18 @@ def get_gitlab_project_id(repo_url):
     # Extract namespace and project from URL
     if repo_url.startswith('git@'):
         # Format: git@gitlab.syncad.com:namespace/project.git
-        parts = repo_url.split(':')[1].rstrip('.git').split('/')
+        path = repo_url.split(':')[1]
+        if path.endswith('.git'):
+            path = path[:-4]  # Remove exactly '.git' suffix
+        parts = path.split('/')
         namespace = parts[0]
         project = parts[1] if len(parts) > 1 else parts[0]
     elif repo_url.startswith('http'):
         # Format: https://gitlab.syncad.com/namespace/project.git
-        parts = repo_url.rstrip('.git').split('/')
+        path = repo_url
+        if path.endswith('.git'):
+            path = path[:-4]  # Remove exactly '.git' suffix
+        parts = path.split('/')
         namespace = parts[-2]
         project = parts[-1]
     else:
