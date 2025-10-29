@@ -71,3 +71,6 @@ git@gitlab.syncad.com:hive/denser.git:
     - filename: '.gitlab-ci.yml'
       key_to_update: 'include[project=hive/haf_api_node].ref'
       submodule_referenced: 'git@gitlab.syncad.com:hive/haf_api_node.git'
+git@gitlab.syncad.com:hive/drone.git:
+  ref: 'develop'
+  automerge: true
