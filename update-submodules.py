@@ -378,6 +378,122 @@ def get_repo_name(repo_url):
         repo_name = repo_name[:-4]
     return repo_name
 
+def project_to_repo_url(project_path):
+    """Convert a GitLab project path (e.g., 'hive/common-ci-configuration') to a repo URL."""
+    return f"git@gitlab.syncad.com:{project_path}.git"
+
+def detect_ci_includes(clone_path):
+    """
+    Detect CI includes from a repository's .gitlab-ci.yml or .gitlab-ci.yaml file.
+
+    Returns a list of dicts with 'project', 'ref', and 'index' (position in include list).
+    Only returns includes that have both 'project' and 'ref' fields.
+    """
+    yaml_obj = YAML()
+    yaml_obj.preserve_quotes = True
+
+    # Try both possible CI file names
+    ci_files = ['.gitlab-ci.yml', '.gitlab-ci.yaml']
+    ci_file_path = None
+    ci_filename = None
+
+    for filename in ci_files:
+        path = os.path.join(clone_path, filename)
+        if os.path.exists(path):
+            ci_file_path = path
+            ci_filename = filename
+            break
+
+    if not ci_file_path:
+        logging.debug(f"No CI file found in {clone_path}")
+        return [], None
+
+    try:
+        with open(ci_file_path, 'r') as f:
+            data = yaml_obj.load(f)
+    except Exception as e:
+        logging.warning(f"Failed to parse CI file {ci_file_path}: {e}")
+        return [], None
+
+    if not data or 'include' not in data:
+        logging.debug(f"No 'include' section in {ci_file_path}")
+        return [], ci_filename
+
+    includes = data['include']
+    if not isinstance(includes, list):
+        logging.debug(f"'include' is not a list in {ci_file_path}")
+        return [], ci_filename
+
+    detected = []
+    for idx, item in enumerate(includes):
+        if isinstance(item, dict) and 'project' in item and 'ref' in item:
+            project = item['project']
+            ref = item['ref']
+            # Normalize project path (remove quotes if present in string)
+            if isinstance(project, str):
+                project = project.strip("'\"")
+            detected.append({
+                'project': project,
+                'ref': ref,
+                'index': idx
+            })
+            logging.debug(f"Detected CI include: project={project}, ref={ref}")
+
+    return detected, ci_filename
+
+def collect_auto_detected_yaml_updates(clone_path, config, updated_repos_commits):
+    """
+    Auto-detect CI includes and collect updates for repos that have been updated.
+
+    Args:
+        clone_path: Path to the cloned repository
+        config: The configuration dictionary
+        updated_repos_commits: Dict mapping repo URLs to their new commit hashes
+
+    Returns:
+        Dict of filename -> list of update entries
+    """
+    detected_includes, ci_filename = detect_ci_includes(clone_path)
+
+    if not detected_includes or not ci_filename:
+        return {}
+
+    updated_yaml_files = {}
+
+    for include in detected_includes:
+        project = include['project']
+        current_ref = include['ref']
+        idx = include['index']
+
+        # Convert project path to repo URL
+        repo_url = project_to_repo_url(project)
+
+        # Check if this project is in our config and has been updated
+        if repo_url in updated_repos_commits:
+            new_commit = updated_repos_commits[repo_url]
+
+            # Skip if the ref is already the new commit
+            if current_ref == new_commit:
+                logging.debug(f"CI include for {project} already at {new_commit}")
+                continue
+
+            logging.info(f"Auto-detected CI include update: {project} {current_ref} -> {new_commit}")
+
+            # Build the key path for this include
+            key_to_update = f"include[project={project}].ref"
+
+            if ci_filename not in updated_yaml_files:
+                updated_yaml_files[ci_filename] = []
+
+            updated_yaml_files[ci_filename].append({
+                'filename': ci_filename,
+                'key_to_update': key_to_update,
+                'submodule_referenced': repo_url,  # Use repo URL for commit lookup
+                'auto_detected': True
+            })
+
+    return updated_yaml_files
+
 def get_submodule_current_commit(repo, submodule):
     """Get the current commit hash of the submodule as recorded in the parent repo."""
     return submodule.hexsha
@@ -692,7 +808,7 @@ def create_merge_request(repo, source_branch, target_branch, automerge=False):
         push_options.append('merge_request.merge_when_pipeline_succeeds=true')
     return push_options
 
-def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabled=False, updated_repos_branches=None):
+def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabled=False, updated_repos_branches=None, updated_repos_commits=None):
     """
     Update a single repository and its submodules.
 
@@ -705,15 +821,19 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
         push_enabled (bool, optional): If True, push changes to remote. If False, only process locally. Defaults to False.
         updated_repos_branches (dict, optional): A mapping of repository URLs to their updated feature branch names.
                                                  Defaults to None.
-    
+        updated_repos_commits (dict, optional): A mapping of repository URLs to their commit hashes.
+                                                Used for auto-detecting CI include updates.
+
     Returns:
         RepoOperationResult: The result of the operation.
     """
     if updated_repos_branches is None:
         updated_repos_branches = {}
+    if updated_repos_commits is None:
+        updated_repos_commits = {}
 
     result = RepoOperationResult(repo_url=repo_url)
-    
+
     clone_path = os.path.join(BASE_DIR, get_repo_name(repo_url))
     repo = clone_repo(repo_url, clone_path)
 
@@ -722,7 +842,7 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
         result.success = False
         result.error_message = "Failed to clone repository"
         return result
-        
+
     result.repo_object = repo
 
     # Retrieve repository-specific settings
@@ -744,6 +864,11 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
     # Checkout the desired reference
     checkout_reference(repo, repo_url, desired_ref_actual)
 
+    # Record this repo's commit hash for CI include updates in downstream repos
+    current_commit = repo.head.commit.hexsha
+    updated_repos_commits[repo_url] = current_commit
+    logging.debug(f"Recorded commit '{current_commit}' for repository '{get_repo_name(repo_url)}'")
+
     # Initialize and update submodules
     update_submodules(repo, repo_url)
 
@@ -751,27 +876,44 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
     updated_submodules, submodule_commits = identify_submodule_updates(repo, config, updated_repos_branches)
     result.submodules_updated = updated_submodules
 
-    if updated_submodules:
+    # Auto-detect CI include updates (regardless of submodule updates)
+    auto_detected_yaml_updates = collect_auto_detected_yaml_updates(clone_path, config, updated_repos_commits)
+
+    # Determine if we have any updates to make
+    has_submodule_updates = bool(updated_submodules)
+    has_ci_include_updates = bool(auto_detected_yaml_updates)
+    has_any_updates = has_submodule_updates or has_ci_include_updates
+
+    if has_any_updates:
         # Create a feature branch for the updates (always create in Phase 1)
-        branch_name = create_feature_branch(repo, repo_url, tag, push_enabled=False)  # Never skip branch creation
+        branch_name = create_feature_branch(repo, repo_url, tag, push_enabled=False)
         result.branch_name = branch_name
 
         if branch_name:
-            # Collect YAML file updates based on submodule updates
-            updated_yaml_files = collect_yaml_updates(settings, updated_submodules)
+            # Collect manual YAML file updates based on submodule updates (from config)
+            manual_yaml_updates = collect_yaml_updates(settings, updated_submodules) if has_submodule_updates else {}
+
+            # Merge manual and auto-detected YAML updates
+            updated_yaml_files = merge_yaml_updates(manual_yaml_updates, auto_detected_yaml_updates)
             result.yaml_files_updated = updated_yaml_files
+
+            # Build complete commit lookup (submodule commits + all repo commits)
+            all_commits = {**submodule_commits, **updated_repos_commits}
 
             # Process YAML file updates (always process in Phase 1)
             if updated_yaml_files:
-                process_yaml_updates(clone_path, updated_yaml_files, submodule_commits)
+                process_yaml_updates(clone_path, updated_yaml_files, all_commits)
 
-            # Commit the submodule updates
-            commit_changes(repo, repo_url, updated_submodules)
+            # Commit the changes
+            commit_changes_extended(repo, repo_url, updated_submodules, updated_yaml_files)
 
             # Record the branch to update parent repositories
-            # This must happen in Phase 1 so dependent repos can use the branch
             updated_repos_branches[repo_url] = branch_name
-            logging.debug(f"Recorded updated branch '{branch_name}' for repository '{repo_url}' in 'updated_repos_branches'.")
+            logging.debug(f"Recorded updated branch '{branch_name}' for repository '{repo_url}'")
+
+            # Update this repo's commit to the new commit after changes
+            updated_repos_commits[repo_url] = repo.head.commit.hexsha
+            logging.debug(f"Updated commit to '{repo.head.commit.hexsha}' for repository '{get_repo_name(repo_url)}'")
 
             # Only push if in Phase 2
             if push_enabled:
@@ -793,7 +935,7 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
 
     # Log a summary of the commits
     log_commit_summary(repo_url, updated_submodules, updated_yaml_files, push_enabled)
-    
+
     return result
 
 def get_desired_ref(repo, repo_url, ref_from_dir, desired_ref):
@@ -1013,6 +1155,48 @@ def commit_changes(repo, repo_url, updated_submodules):
         logging.error(f"Failed to commit changes in '{get_repo_name(repo_url)}': {e}")
         sys.exit(1)
 
+def commit_changes_extended(repo, repo_url, updated_submodules, updated_yaml_files):
+    """Commit changes with a detailed message covering submodules and CI includes."""
+    commit_lines = []
+
+    # Add submodule updates to commit message
+    if updated_submodules:
+        commit_lines.append("Update submodules:")
+        for details in updated_submodules.values():
+            commit_lines.append(f" - {details['name']}: {details['ref']} ({details['commit']})")
+
+    # Add CI include updates to commit message
+    ci_include_updates = []
+    for filename, edits in updated_yaml_files.items():
+        for edit in edits:
+            if edit.get('auto_detected'):
+                # Extract project name from key_to_update
+                key = edit['key_to_update']
+                # key format: include[project=hive/common-ci-configuration].ref
+                if 'project=' in key:
+                    project = key.split('project=')[1].split(']')[0]
+                    ci_include_updates.append(project)
+
+    if ci_include_updates:
+        if commit_lines:
+            commit_lines.append("")  # Add blank line between sections
+        commit_lines.append("Update CI includes:")
+        for project in sorted(set(ci_include_updates)):
+            commit_lines.append(f" - {project}")
+
+    if not commit_lines:
+        commit_lines.append("Update dependencies")
+
+    commit_message = "\n".join(commit_lines)
+    logging.info(f"Committing changes in '{get_repo_name(repo_url)}' with message:\n{commit_message}")
+
+    try:
+        repo.index.commit(commit_message)
+        logging.debug(f"Committed changes in '{get_repo_name(repo_url)}' on branch '{repo.active_branch}'.")
+    except GitCommandError as e:
+        logging.error(f"Failed to commit changes in '{get_repo_name(repo_url)}': {e}")
+        sys.exit(1)
+
 def push_branch(repo, repo_url, branch_name, settings, automerge, create_mr, dry_run):
     """Push the feature branch to the remote repository and create a merge request if applicable."""
     if dry_run:
@@ -1053,6 +1237,36 @@ def collect_yaml_updates(current_repo_settings, updated_submodules):
                 'submodule_referenced': submodule_referenced_url  # Use absolute URL
             })
     return updated_yaml_files
+
+def merge_yaml_updates(manual_updates, auto_detected_updates):
+    """
+    Merge manual (from config) and auto-detected YAML updates.
+
+    Auto-detected updates take precedence over manual ones for the same key,
+    since they reflect the actual CI file structure.
+    """
+    merged = {}
+
+    # Start with manual updates
+    for filename, edits in manual_updates.items():
+        if filename not in merged:
+            merged[filename] = []
+        merged[filename].extend(edits)
+
+    # Add auto-detected updates, avoiding duplicates
+    for filename, edits in auto_detected_updates.items():
+        if filename not in merged:
+            merged[filename] = []
+
+        existing_keys = {edit['key_to_update'] for edit in merged[filename]}
+        for edit in edits:
+            if edit['key_to_update'] not in existing_keys:
+                merged[filename].append(edit)
+                logging.debug(f"Added auto-detected update: {filename} -> {edit['key_to_update']}")
+            else:
+                logging.debug(f"Skipping duplicate key: {filename} -> {edit['key_to_update']}")
+
+    return merged
 
 def process_yaml_updates(clone_path, updated_yaml_files, submodule_commits):
     """Process YAML file updates."""
@@ -1425,8 +1639,9 @@ def main():
         logging.error("YAML validation failed. Please fix the errors above and try again.")
         sys.exit(1)
     
-    # Initialize a mapping to track repositories updated via branches
-    updated_repos_branches = {}
+    # Initialize mappings to track repository state
+    updated_repos_branches = {}  # Maps repo URLs to their feature branch names
+    updated_repos_commits = {}   # Maps repo URLs to their commit hashes (for CI include updates)
     operations = {}
 
     for repo_url in sorted_repos:
@@ -1434,14 +1649,14 @@ def main():
         if not settings:
             logging.error(f"No settings found for repository '{repo_url}'. Skipping.")
             continue
-            
+
         tag = args.tag
         retag = args.retag
         desired_ref = settings.get('ref') if 'ref' in settings else None
         desired_ref_from_dir = settings.get('ref_from_dir') if 'ref_from_dir' in settings else None
-        
+
         logging.info(f"\nProcessing repository '{get_repo_name(repo_url)}' to '{desired_ref if desired_ref else 'ref_from_dir'}'...")
-        
+
         # Phase 1: Process locally only
         result = update_repo(
             repo_url=repo_url,
@@ -1450,7 +1665,8 @@ def main():
             tag=tag,
             retag=retag,
             push_enabled=False,  # Phase 1: local only
-            updated_repos_branches=updated_repos_branches
+            updated_repos_branches=updated_repos_branches,
+            updated_repos_commits=updated_repos_commits
         )
         
         operations[repo_url] = result
@@ -1492,8 +1708,15 @@ def main():
                             for sub_url, sub_details in operation.submodules_updated.items():
                                 logging.info(f"      - Updated submodule: {sub_details['name']} to {sub_details['ref']}")
                         if operation.yaml_files_updated:
-                            for filename in operation.yaml_files_updated.keys():
-                                logging.info(f"      - Modified YAML: {filename}")
+                            for filename, edits in operation.yaml_files_updated.items():
+                                for edit in edits:
+                                    if edit.get('auto_detected'):
+                                        # Extract project from key
+                                        key = edit['key_to_update']
+                                        project = key.split('project=')[1].split(']')[0] if 'project=' in key else 'unknown'
+                                        logging.info(f"      - Auto-detected CI include: {project} in {filename}")
+                                    else:
+                                        logging.info(f"      - Modified YAML: {filename} ({edit['key_to_update']})")
 
                 # Tag info
                 if operation.tag_to_create:

@@ -80,8 +80,31 @@ The scripts build a dependency graph from submodule relationships and process re
 
 Dry-run (`--dry-run`) only executes Phase 1.
 
-### YAML Updates
-The `update_yaml` feature modifies CI config files to reference the correct submodule commits. Key path syntax supports conditional matching: `include[project=hive/haf].ref` finds the list item where `project=hive/haf` and updates its `ref` field.
+### CI Include Auto-Detection
+The script automatically detects and updates GitLab CI `include:` entries that reference other repos in the config. When a repo is processed:
+
+1. The script scans `.gitlab-ci.yml` / `.gitlab-ci.yaml` for `include:` entries with `project:` and `ref:` fields
+2. If the included project is in the config, its `ref:` is updated to the new commit hash
+3. This works for any CI include pattern like:
+   ```yaml
+   include:
+     - project: 'hive/common-ci-configuration'
+       ref: develop  # Auto-updated to commit hash
+   ```
+
+No manual `update_yaml` config is needed for CI includes - they're detected automatically.
+
+### Manual YAML Updates
+For YAML files that aren't the main CI file (e.g., local includes), use the `update_yaml` config:
+
+```yaml
+update_yaml:
+  - filename: 'scripts/ci-helpers/prepare_data_image_job.yml'
+    key_to_update: 'include[project=hive/hive].ref'
+    submodule_referenced: 'git@gitlab.syncad.com:hive/hive.git'
+```
+
+Key path syntax supports conditional matching: `include[project=hive/haf].ref` finds the list item where `project=hive/haf` and updates its `ref` field.
 
 ### Branch Naming
 Feature branches are named `update-submodules` or `update-submodules-for-<tag>`, with numeric suffixes (`-2`, `-3`) if the name already exists.
