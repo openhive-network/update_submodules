@@ -1,5 +1,5 @@
 git@gitlab.syncad.com:hive/haf.git:
-  ref: 'develop'
+  ref: 'master'
   # or
   # ref_from_dir: /path/to/local/checkout/of/haf
   automerge: true
@@ -8,61 +8,62 @@ git@gitlab.syncad.com:hive/haf.git:
       key_to_update: 'include[project=hive/hive].ref'
       submodule_referenced: 'git@gitlab.syncad.com:hive/hive.git'
 git@gitlab.syncad.com:hive/hive.git:
-  ref: 'develop'
+  ref: 'master'
+  source_ref: '9ee683d80'
   automerge: true
 git@gitlab.syncad.com:hive/haf_api_node.git:
-  ref: 'develop'
+  ref: 'master'
   automerge: true
 git@gitlab.syncad.com:hive/reputation_tracker.git:
-  ref: 'develop'
+  ref: 'main'
   automerge: true
   update_yaml:
     - filename: '.gitlab-ci.yml'
       key_to_update: 'include[project=hive/haf].ref'
       submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
 git@gitlab.syncad.com:hive/balance_tracker.git:
-  ref: 'develop'
+  ref: 'master'
   automerge: true
   update_yaml:
     - filename: '.gitlab-ci.yml'
       key_to_update: 'include[project=hive/haf].ref'
       submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
 git@gitlab.syncad.com:hive/HAfAH.git:
-  ref: 'develop'
+  ref: 'master'
   automerge: true
   update_yaml:
     - filename: '.gitlab-ci.yml'
       key_to_update: 'include[project=hive/haf].ref'
       submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
 git@gitlab.syncad.com:hive/hivemind.git:
-  ref: 'develop'
+  ref: 'master'
   automerge: true
   update_yaml:
     - filename: '.gitlab-ci.yaml'
       key_to_update: 'include[project=hive/haf].ref'
       submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
 git@gitlab.syncad.com:hive/haf_block_explorer.git:
-  ref: 'develop'
+  ref: 'master'
   automerge: true
   update_yaml:
     - filename: '.gitlab-ci.yml'
       key_to_update: 'include[project=hive/haf].ref'
       submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
 git@gitlab.syncad.com:hive/hivesense.git:
-  ref: 'develop'
+  ref: 'main'
   automerge: true
   update_yaml:
     - filename: '.gitlab-ci.yml'
       key_to_update: 'include[project=hive/haf].ref'
       submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
 git@gitlab.syncad.com:hive/nft_tracker.git:
-  ref: 'develop'
+  ref: 'master'
   automerge: true
 git@gitlab.syncad.com:hive/block_explorer_ui.git:
-  ref: 'develop'
+  ref: 'master'
   automerge: true
 git@gitlab.syncad.com:hive/denser.git:
-  ref: 'develop'
+  ref: 'main'
   automerge: true
   update_yaml:
     - filename: '.gitlab-ci.yml'
@@ -72,5 +73,5 @@ git@gitlab.syncad.com:hive/denser.git:
       key_to_update: 'include[project=hive/haf_api_node].ref'
       submodule_referenced: 'git@gitlab.syncad.com:hive/haf_api_node.git'
 git@gitlab.syncad.com:hive/drone.git:
-  ref: 'develop'
+  ref: 'master'
   automerge: true
