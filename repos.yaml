@@ -61,6 +61,10 @@ git@gitlab.syncad.com:hive/block_explorer_ui.git:
 git@gitlab.syncad.com:hive/denser.git:
   ref: 'develop'
   automerge: true
+  update_yaml:
+    - filename: '.gitlab-ci.yml'
+      key_to_update: 'variables.HAF_COMMIT'
+      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
 
 # Tools
 git@gitlab.syncad.com:hive/drone.git:
