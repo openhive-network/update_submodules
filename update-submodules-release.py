@@ -1810,6 +1810,13 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
         else:
             logging.info(f"Phase 1: Tag '{tag}' created locally, will push in Phase 2")
 
+    # Always record the current commit for CI include auto-detection
+    # This is needed even if no submodule changes, so dependent repos can update their CI includes
+    if repo_url not in updated_repos_commits:
+        final_commit = repo.head.commit.hexsha
+        updated_repos_commits[repo_url] = final_commit
+        logging.debug(f"Recorded develop HEAD '{final_commit[:8]}' for repository '{repo_url}' (no changes)")
+
     # Log a summary of the commits
     log_commit_summary(repo_url, updated_submodules, updated_yaml_files, push_enabled)
 
