@@ -103,7 +103,24 @@ Dry-run (`--dry-run`) only executes Phase 1.
 The `update_yaml` feature modifies CI config files to reference the correct submodule commits. Key path syntax supports conditional matching: `include[project=hive/haf].ref` finds the list item where `project=hive/haf` and updates its `ref` field.
 
 ### Branch Naming
-Feature branches are named `update-submodules` or `update-submodules-for-<tag>`, with numeric suffixes (`-2`, `-3`) if the name already exists.
+Feature branches are named based on the operation:
+- Default: `update-submodules`
+- With `--tag v1.28.0`: `update-submodules-for-v1.28.0`
+- With `--haf-branch feature/my-branch`: `update-submodules-for-haf-feature-my-branch`
+
+Numeric suffixes (`-2`, `-3`) are added if the name already exists.
+
+## Docker Usage
+
+The script can run in a container for isolated execution:
+
+```bash
+# Build the image
+docker build -t update-submodules .
+
+# Run with SSH keys
+docker run --rm -v ~/.ssh:/ssh-keys:ro update-submodules --haf-branch feature/my-branch --dry-run
+```
 
 ## Key Dependencies
 
