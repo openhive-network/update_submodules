@@ -3,10 +3,7 @@ git@gitlab.syncad.com:hive/haf.git:
   # or
   # ref_from_dir: /path/to/local/checkout/of/haf
   automerge: true
-  update_yaml:
-    - filename: 'scripts/ci-helpers/prepare_data_image_job.yml'
-      key_to_update: 'include[project=hive/hive].ref'
-      submodule_referenced: 'git@gitlab.syncad.com:hive/hive.git'
+  # update_yaml removed: prepare_data_image_job.yml now uses common-ci-configuration
 git@gitlab.syncad.com:hive/hive.git:
   ref: 'develop'
   automerge: true
@@ -16,45 +13,27 @@ git@gitlab.syncad.com:hive/haf_api_node.git:
 git@gitlab.syncad.com:hive/reputation_tracker.git:
   ref: 'develop'
   automerge: true
-  update_yaml:
-    - filename: '.gitlab-ci.yml'
-      key_to_update: 'include[project=hive/haf].ref'
-      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
+  # update_yaml removed: now uses common-ci-configuration with dynamic HAF detection
 git@gitlab.syncad.com:hive/balance_tracker.git:
   ref: 'develop'
   automerge: true
-  update_yaml:
-    - filename: '.gitlab-ci.yml'
-      key_to_update: 'include[project=hive/haf].ref'
-      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
+  # update_yaml removed: now uses common-ci-configuration with dynamic HAF detection
 git@gitlab.syncad.com:hive/HAfAH.git:
   ref: 'develop'
   automerge: true
-  update_yaml:
-    - filename: '.gitlab-ci.yml'
-      key_to_update: 'include[project=hive/haf].ref'
-      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
+  # update_yaml removed: now uses common-ci-configuration with dynamic HAF detection
 git@gitlab.syncad.com:hive/hivemind.git:
   ref: 'develop'
   automerge: true
-  update_yaml:
-    - filename: '.gitlab-ci.yaml'
-      key_to_update: 'include[project=hive/haf].ref'
-      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
+  # update_yaml removed: now uses common-ci-configuration with dynamic HAF detection
 git@gitlab.syncad.com:hive/haf_block_explorer.git:
   ref: 'develop'
   automerge: true
-  update_yaml:
-    - filename: '.gitlab-ci.yml'
-      key_to_update: 'include[project=hive/haf].ref'
-      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
+  # update_yaml removed: now uses common-ci-configuration with dynamic HAF detection
 git@gitlab.syncad.com:hive/hivesense.git:
   ref: 'develop'
   automerge: true
-  update_yaml:
-    - filename: '.gitlab-ci.yml'
-      key_to_update: 'include[project=hive/haf].ref'
-      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
+  # update_yaml removed: now uses common-ci-configuration with dynamic HAF detection
 git@gitlab.syncad.com:hive/nft_tracker.git:
   ref: 'develop'
   automerge: true

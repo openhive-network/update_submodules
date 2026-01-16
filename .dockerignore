@@ -1,0 +1,5 @@
+repositories/
+*.log
+__pycache__/
+.git/
+config.ini

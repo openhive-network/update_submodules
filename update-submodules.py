@@ -17,6 +17,7 @@ from git import Repo, GitCommandError
 # Configuration
 CONFIG_FILE = 'repos.yaml'
 BASE_DIR = 'repositories'  # Directory to clone repositories into
+HAF_REPO_URL = 'git@gitlab.syncad.com:hive/haf.git'  # HAF repository URL for --haf-branch feature
 
 @dataclass
 class RepoOperationResult:
@@ -63,6 +64,7 @@ def parse_arguments():
     parser.add_argument('--retag', '-r', action='store_true', help='Overwrite existing tags with the same name when using --tag.')
     parser.add_argument('--cleanup', action='store_true', help='Clean up branches, tags, and MRs from a previous failed run.')
     parser.add_argument('--cleanup-tag', type=str, help='Specific tag to clean up when using --cleanup.')
+    parser.add_argument('--haf-branch', type=str, help='Override HAF branch/ref for testing. Automatically updates UPSTREAM_OVERRIDE_TAG in dependent projects.')
     return parser.parse_args()
 
 def get_gitlab_credentials():
@@ -671,10 +673,14 @@ def validate_refs(config, tag=None):
     else:
         logging.info("All refs in the configuration are valid.")
 
-def create_branch_name(repo_url, tag=None, counter=None):
+def create_branch_name(repo_url, tag=None, counter=None, haf_branch=None):
     """Generate a unique branch name."""
     base_name = "update-submodules"
-    if tag:
+    if haf_branch:
+        # Sanitize branch name: replace slashes and special chars
+        sanitized = haf_branch.replace('/', '-').replace('_', '-')
+        base_name += f"-for-haf-{sanitized}"
+    elif tag:
         base_name += f"-for-{tag}"
     if counter:
         base_name += f"-{counter}"
@@ -692,7 +698,7 @@ def create_merge_request(repo, source_branch, target_branch, automerge=False):
         push_options.append('merge_request.merge_when_pipeline_succeeds=true')
     return push_options
 
-def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabled=False, updated_repos_branches=None):
+def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabled=False, updated_repos_branches=None, forced_commits=None, haf_branch=None):
     """
     Update a single repository and its submodules.
 
@@ -705,12 +711,17 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
         push_enabled (bool, optional): If True, push changes to remote. If False, only process locally. Defaults to False.
         updated_repos_branches (dict, optional): A mapping of repository URLs to their updated feature branch names.
                                                  Defaults to None.
-    
+        forced_commits (dict, optional): A mapping of repository URLs to commit hashes for forced YAML updates
+                                         (e.g., when using --haf-branch). Defaults to None.
+        haf_branch (str, optional): HAF branch name for branch naming when using --haf-branch. Defaults to None.
+
     Returns:
         RepoOperationResult: The result of the operation.
     """
     if updated_repos_branches is None:
         updated_repos_branches = {}
+    if forced_commits is None:
+        forced_commits = {}
 
     result = RepoOperationResult(repo_url=repo_url)
     
@@ -751,22 +762,32 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
     updated_submodules, submodule_commits = identify_submodule_updates(repo, config, updated_repos_branches)
     result.submodules_updated = updated_submodules
 
-    if updated_submodules:
+    # Collect YAML file updates (check both submodule updates and forced commits)
+    updated_yaml_files = collect_yaml_updates(settings, updated_submodules, forced_commits)
+    result.yaml_files_updated = updated_yaml_files
+
+    # Merge submodule_commits with forced_commits for YAML processing
+    all_commits = {**submodule_commits, **forced_commits}
+
+    # Determine if we need to create a branch (submodule updates OR forced YAML updates)
+    needs_branch = bool(updated_submodules) or bool(updated_yaml_files)
+
+    if needs_branch:
         # Create a feature branch for the updates (always create in Phase 1)
-        branch_name = create_feature_branch(repo, repo_url, tag, push_enabled=False)  # Never skip branch creation
+        branch_name = create_feature_branch(repo, repo_url, tag, push_enabled=False, haf_branch=haf_branch)  # Never skip branch creation
         result.branch_name = branch_name
 
         if branch_name:
-            # Collect YAML file updates based on submodule updates
-            updated_yaml_files = collect_yaml_updates(settings, updated_submodules)
-            result.yaml_files_updated = updated_yaml_files
-
             # Process YAML file updates (always process in Phase 1)
             if updated_yaml_files:
-                process_yaml_updates(clone_path, updated_yaml_files, submodule_commits)
+                process_yaml_updates(clone_path, updated_yaml_files, all_commits)
 
-            # Commit the submodule updates
-            commit_changes(repo, repo_url, updated_submodules)
+            # Commit the changes (submodules and/or YAML files)
+            if updated_submodules:
+                commit_changes(repo, repo_url, updated_submodules)
+            elif updated_yaml_files:
+                # Commit YAML-only changes (for forced updates like --haf-branch)
+                commit_yaml_only_changes(repo, repo_url, updated_yaml_files)
 
             # Record the branch to update parent repositories
             # This must happen in Phase 1 so dependent repos can use the branch
@@ -951,11 +972,12 @@ def determine_submodule_ref(submodule, config, updated_repos_branches, parent_re
             desired_ref_submodule = sub_settings.get('ref')
     return desired_ref_submodule
 
-def create_feature_branch(repo, repo_url, tag, push_enabled):
+def create_feature_branch(repo, repo_url, tag, push_enabled, haf_branch=None):
     """Create a new feature branch for committing the updates.
-    
+
     Args:
         push_enabled: If False, we're in Phase 1 (local only). If True, we're in Phase 2.
+        haf_branch: If specified, include HAF branch name in the branch name.
     """
     # Always create branches locally in Phase 1
 
@@ -976,11 +998,13 @@ def create_feature_branch(repo, repo_url, tag, push_enabled):
     counter = 1
 
     while not branch_created:
-        if tag:
-            # Pass 'counter' only if it's greater than 1 to maintain naming consistency
-            candidate_branch = create_branch_name(repo_url, tag=tag, counter=counter if counter > 1 else None)
-        else:
-            candidate_branch = create_branch_name(repo_url, counter=counter if counter > 1 else None)
+        # Pass 'counter' only if it's greater than 1 to maintain naming consistency
+        candidate_branch = create_branch_name(
+            repo_url,
+            tag=tag,
+            counter=counter if counter > 1 else None,
+            haf_branch=haf_branch
+        )
 
         if candidate_branch not in existing_branches:
             branch_name = candidate_branch
@@ -1013,6 +1037,21 @@ def commit_changes(repo, repo_url, updated_submodules):
         logging.error(f"Failed to commit changes in '{get_repo_name(repo_url)}': {e}")
         sys.exit(1)
 
+def commit_yaml_only_changes(repo, repo_url, updated_yaml_files):
+    """Commit YAML-only changes (for forced updates like --haf-branch)."""
+    commit_lines = ["Update CI configuration for HAF branch testing:"]
+    for filename in updated_yaml_files.keys():
+        commit_lines.append(f" - {filename}")
+    commit_message = "\n".join(commit_lines)
+    logging.info(f"Committing YAML changes in '{get_repo_name(repo_url)}' with message:\n{commit_message}")
+
+    try:
+        repo.index.commit(commit_message)
+        logging.debug(f"Committed YAML changes in '{get_repo_name(repo_url)}' on branch '{repo.active_branch}'.")
+    except GitCommandError as e:
+        logging.error(f"Failed to commit YAML changes in '{get_repo_name(repo_url)}': {e}")
+        sys.exit(1)
+
 def push_branch(repo, repo_url, branch_name, settings, automerge, create_mr, dry_run):
     """Push the feature branch to the remote repository and create a merge request if applicable."""
     if dry_run:
@@ -1035,14 +1074,24 @@ def push_branch(repo, repo_url, branch_name, settings, automerge, create_mr, dry
         logging.error(f"Failed to push branch '{branch_name}' to '{repo_url}': {e}")
         sys.exit(1)
 
-def collect_yaml_updates(current_repo_settings, updated_submodules):
-    """Collect YAML file updates based on submodule updates for the current repository."""
+def collect_yaml_updates(current_repo_settings, updated_submodules, forced_commits=None):
+    """Collect YAML file updates based on submodule updates for the current repository.
+
+    Args:
+        current_repo_settings: Settings for the current repository
+        updated_submodules: Dict of submodules that were updated in this repo
+        forced_commits: Optional dict of repo_url -> commit for forced updates (e.g., --haf-branch)
+    """
+    if forced_commits is None:
+        forced_commits = {}
+
     updated_yaml_files = {}
     update_yaml_entries = current_repo_settings.get('update_yaml', [])
     for edit in update_yaml_entries:
         # The 'submodule_referenced' should be an absolute URL as per the config
         submodule_referenced_url = edit['submodule_referenced']
-        if submodule_referenced_url in updated_submodules:
+        # Check if this submodule was updated OR if we have a forced commit for it
+        if submodule_referenced_url in updated_submodules or submodule_referenced_url in forced_commits:
             filename = edit['filename']
             key_to_update = edit['key_to_update']
             if filename not in updated_yaml_files:
@@ -1382,6 +1431,74 @@ def push_all_operations(operations, sorted_repos):
         logging.info("All changes pushed successfully!")
         return True
 
+def apply_haf_branch_override(config, haf_branch):
+    """
+    Apply --haf-branch override to the configuration.
+
+    This function:
+    1. Overrides HAF's ref to the specified branch
+    2. Injects update_yaml entries for UPSTREAM_OVERRIDE_TAG in projects that use
+       the common-ci-configuration with dynamic HAF detection
+
+    Args:
+        config: The configuration dictionary loaded from repos.yaml
+        haf_branch: The HAF branch/ref to use
+
+    Returns:
+        Modified config dictionary
+    """
+    if HAF_REPO_URL not in config:
+        logging.error(f"HAF repository '{HAF_REPO_URL}' not found in config. Cannot apply --haf-branch override.")
+        sys.exit(1)
+
+    # Override HAF's ref
+    original_ref = config[HAF_REPO_URL].get('ref', 'N/A')
+    config[HAF_REPO_URL]['ref'] = haf_branch
+    # Remove ref_from_dir if present, as we're overriding with a branch
+    if 'ref_from_dir' in config[HAF_REPO_URL]:
+        del config[HAF_REPO_URL]['ref_from_dir']
+
+    logging.info(f"Overriding HAF ref: '{original_ref}' -> '{haf_branch}'")
+
+    # Projects that use common-ci-configuration with UPSTREAM_OVERRIDE_TAG support
+    # These are projects that have HAF as a dependency and use dynamic image detection
+    projects_needing_upstream_override = [
+        'git@gitlab.syncad.com:hive/reputation_tracker.git',
+        'git@gitlab.syncad.com:hive/balance_tracker.git',
+        'git@gitlab.syncad.com:hive/HAfAH.git',
+        'git@gitlab.syncad.com:hive/hivemind.git',
+        'git@gitlab.syncad.com:hive/haf_block_explorer.git',
+        'git@gitlab.syncad.com:hive/hivesense.git',
+    ]
+
+    # Inject update_yaml entries for UPSTREAM_OVERRIDE_TAG
+    for repo_url in projects_needing_upstream_override:
+        if repo_url not in config:
+            logging.debug(f"Repository '{repo_url}' not in config, skipping UPSTREAM_OVERRIDE_TAG injection")
+            continue
+
+        # Initialize update_yaml list if not present
+        if 'update_yaml' not in config[repo_url]:
+            config[repo_url]['update_yaml'] = []
+
+        # Check if UPSTREAM_OVERRIDE_TAG entry already exists
+        existing_entries = config[repo_url]['update_yaml']
+        has_override_tag = any(
+            e.get('key_to_update') == 'variables.UPSTREAM_OVERRIDE_TAG'
+            for e in existing_entries
+        )
+
+        if not has_override_tag:
+            # Add UPSTREAM_OVERRIDE_TAG update entry
+            config[repo_url]['update_yaml'].append({
+                'filename': '.gitlab-ci.yml',
+                'key_to_update': 'variables.UPSTREAM_OVERRIDE_TAG',
+                'submodule_referenced': HAF_REPO_URL
+            })
+            logging.info(f"Injected UPSTREAM_OVERRIDE_TAG update for '{get_repo_name(repo_url)}'")
+
+    return config
+
 def main():
     """Main function to orchestrate the update process."""
     args = parse_arguments()
@@ -1391,7 +1508,11 @@ def main():
     # Load and validate configuration
     config = load_config(CONFIG_FILE)
     validate_config(config)
-    
+
+    # Apply --haf-branch override if specified
+    if args.haf_branch:
+        config = apply_haf_branch_override(config, args.haf_branch)
+
     # Handle cleanup mode
     if args.cleanup:
         run_cleanup(config, args.cleanup_tag, args.dry_run)
@@ -1428,20 +1549,22 @@ def main():
     # Initialize a mapping to track repositories updated via branches
     updated_repos_branches = {}
     operations = {}
+    # Track forced commits for --haf-branch feature
+    forced_commits = {}
 
     for repo_url in sorted_repos:
         settings = config.get(repo_url, {})
         if not settings:
             logging.error(f"No settings found for repository '{repo_url}'. Skipping.")
             continue
-            
+
         tag = args.tag
         retag = args.retag
         desired_ref = settings.get('ref') if 'ref' in settings else None
         desired_ref_from_dir = settings.get('ref_from_dir') if 'ref_from_dir' in settings else None
-        
+
         logging.info(f"\nProcessing repository '{get_repo_name(repo_url)}' to '{desired_ref if desired_ref else 'ref_from_dir'}'...")
-        
+
         # Phase 1: Process locally only
         result = update_repo(
             repo_url=repo_url,
@@ -1450,10 +1573,24 @@ def main():
             tag=tag,
             retag=retag,
             push_enabled=False,  # Phase 1: local only
-            updated_repos_branches=updated_repos_branches
+            updated_repos_branches=updated_repos_branches,
+            forced_commits=forced_commits,
+            haf_branch=args.haf_branch
         )
-        
+
         operations[repo_url] = result
+
+        # If this is HAF and we're using --haf-branch, capture its commit for forced updates
+        if args.haf_branch and repo_url == HAF_REPO_URL and result.success:
+            haf_clone_path = os.path.join(BASE_DIR, get_repo_name(HAF_REPO_URL))
+            try:
+                haf_repo = Repo(haf_clone_path)
+                haf_commit = haf_repo.head.commit.hexsha
+                forced_commits[HAF_REPO_URL] = haf_commit
+                logging.info(f"Captured HAF commit for forced updates: {haf_commit[:12]}")
+            except Exception as e:
+                logging.error(f"Failed to capture HAF commit: {e}")
+                sys.exit(1)
         
         if not result.success:
             logging.error(f"Failed to process repository '{repo_url}': {result.error_message}")

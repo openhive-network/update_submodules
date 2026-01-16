@@ -62,12 +62,31 @@ python3 update-submodules.py --log-level DEBUG
 # Cleanup branches and tags from failed run
 python3 update-submodules.py --cleanup --cleanup-tag v1.28.0
 
+# Test all projects with a HAF feature branch
+python3 update-submodules.py --haf-branch feature/my-haf-branch
+
 # Prepare all repos on develop branch
 python3 checkout_develop_versions.py ../src
 
 # Revert changes from update script
 python3 revert_update_submodules.py ../src v1.28.0
 ```
+
+### Testing with a HAF Feature Branch
+
+The `--haf-branch` option allows testing all dependent projects with a specific HAF branch:
+
+```bash
+python3 update-submodules.py --haf-branch feature/my-haf-branch --dry-run
+```
+
+This automatically:
+1. Overrides HAF's ref to the specified branch
+2. Updates submodule references in all repos that have HAF as a submodule
+3. Sets `UPSTREAM_OVERRIDE_TAG` in CI files for projects using dynamic HAF detection
+4. Creates MRs in all affected projects
+
+**Prerequisites**: The HAF branch must have CI-built Docker images available at `registry.gitlab.syncad.com/hive/haf:<commit-sha>`
 
 ## Architecture
 
