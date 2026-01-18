@@ -66,7 +66,20 @@ git@gitlab.syncad.com:hive/denser.git:
       key_to_update: 'variables.HAF_COMMIT'
       submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
 
+# Test utilities (submodules used by multiple repos)
+git@gitlab.syncad.com:hive/tests_api.git:
+  ref: 'master'
+  automerge: true
+
 # Tools
 git@gitlab.syncad.com:hive/drone.git:
   ref: 'develop'
+  automerge: true
+
+git@gitlab.syncad.com:hive/wax.git:
+  ref: 'develop'
+  automerge: true
+
+git@gitlab.syncad.com:hive/beekeeper.git:
+  ref: 'master'
   automerge: true
