@@ -10,7 +10,11 @@ config = configparser.ConfigParser()
 config.read('config.ini')
 
 GITLAB_API_URL = config.get('gitlab', 'api_url', fallback="https://gitlab.syncad.com/api/v4")
-GITLAB_TOKEN = config.get('gitlab', 'token')
+# Prefer env var, fall back to config file
+GITLAB_TOKEN = os.environ.get('GITLAB_TOKEN') or config.get('gitlab', 'token', fallback=None)
+if not GITLAB_TOKEN:
+    print("Error: GITLAB_TOKEN environment variable or config.ini gitlab.token required")
+    sys.exit(1)
 
 def run_git_command(command, cwd=None, hide_output=False):
     print(f"Running command: {' '.join(command)} in directory: {cwd}")
