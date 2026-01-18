@@ -548,28 +548,37 @@ def get_submodule_desired_commit(submodule_repo, desired_ref, submodule_url=None
         # Fetch from origin if not using local remote
         if not local_remote_used:
             submodule_repo.remotes.origin.fetch()
-        
-        # Check if ref exists as a local branch
-        if is_branch(desired_ref, submodule_repo):
-            submodule_repo.git.checkout(desired_ref)
-            if not local_remote_used:
-                submodule_repo.remotes.origin.pull()
-            desired_commit = submodule_repo.head.commit.hexsha
-            return desired_commit
-            
-        # Check if ref exists as a remote branch (try local_temp first if available)
+
+        # When using local remote, ALWAYS checkout from local_temp to avoid stale local branches
+        # This fixes a bug where old branches from previous runs could be used instead of fresh commits
         if local_remote_used:
             try:
                 remote_branch = f"local_temp/{desired_ref}"
+                # Delete any existing local branch to ensure we get the fresh commit
+                if is_branch(desired_ref, submodule_repo):
+                    logging.debug(f"Deleting stale local branch '{desired_ref}' to use fresh commit from local remote")
+                    submodule_repo.git.branch('-D', desired_ref)
                 submodule_repo.git.checkout('-b', desired_ref, remote_branch)
                 desired_commit = submodule_repo.head.commit.hexsha
+                logging.debug(f"Checked out '{desired_ref}' from local remote at commit {desired_commit[:12]}")
                 return desired_commit
-            except GitCommandError:
-                pass
-        
+            except GitCommandError as e:
+                logging.debug(f"Could not checkout from local_temp/{desired_ref}: {e}")
+                # Fall through to try other methods
+
+        # Check if ref exists as a local branch (only when NOT using local remote)
+        if not local_remote_used and is_branch(desired_ref, submodule_repo):
+            submodule_repo.git.checkout(desired_ref)
+            submodule_repo.remotes.origin.pull()
+            desired_commit = submodule_repo.head.commit.hexsha
+            return desired_commit
+
         # Try origin remote branch
         try:
             remote_branch = f"origin/{desired_ref}"
+            # Delete any existing local branch if we need to recreate from origin
+            if is_branch(desired_ref, submodule_repo):
+                submodule_repo.git.branch('-D', desired_ref)
             submodule_repo.git.checkout('-b', desired_ref, remote_branch)
             if not local_remote_used:
                 submodule_repo.remotes.origin.pull()
@@ -577,13 +586,13 @@ def get_submodule_desired_commit(submodule_repo, desired_ref, submodule_url=None
             return desired_commit
         except GitCommandError:
             pass
-            
+
         # Check if ref exists as a tag
         if desired_ref in [tag.name for tag in submodule_repo.tags]:
             submodule_repo.git.checkout(desired_ref)
             desired_commit = submodule_repo.head.commit.hexsha
             return desired_commit
-            
+
         # Attempt to resolve as a commit hash
         try:
             desired_commit = submodule_repo.commit(desired_ref).hexsha
@@ -978,10 +987,26 @@ def fetch_updates(repo, repo_url):
         sys.exit(1)
 
 def checkout_reference(repo, repo_url, desired_ref_actual):
-    """Checkout the desired reference in the repository."""
+    """Checkout the desired reference in the repository.
+
+    For branches that exist on origin, reset to origin to ensure we have the latest code.
+    This prevents creating tags from stale local branches that are behind origin.
+    """
     try:
         repo.git.checkout(desired_ref_actual)
         logging.debug(f"Checked out '{desired_ref_actual}' in '{get_repo_name(repo_url)}'.")
+
+        # If this is a branch that exists on origin, reset to origin to get latest code
+        # This fixes a bug where local branches behind origin would result in stale tags
+        try:
+            origin_ref = f'origin/{desired_ref_actual}'
+            repo.git.rev_parse('--verify', origin_ref)  # Check if origin ref exists
+            repo.git.reset('--hard', origin_ref)
+            logging.debug(f"Reset '{desired_ref_actual}' to '{origin_ref}' in '{get_repo_name(repo_url)}'.")
+        except GitCommandError:
+            # Not a branch on origin (could be a tag or detached HEAD), that's fine
+            pass
+
     except GitCommandError:
         logging.warning(f"Reference '{desired_ref_actual}' not found in '{repo_url}'. Attempting to create it from 'origin/{desired_ref_actual}'.")
         try:
