@@ -2,6 +2,7 @@
 
 import os
 import sys
+import time
 import yaml
 import git
 import argparse
@@ -464,6 +465,11 @@ def collect_auto_detected_yaml_updates(clone_path, config, updated_repos_commits
         project = include['project']
         current_ref = include['ref']
         idx = include['index']
+
+        # Skip common-ci-configuration - repos expect ref: develop for dynamic templates
+        if project == 'hive/common-ci-configuration':
+            logging.debug(f"Skipping CI include for {project} - should remain dynamic")
+            continue
 
         # Convert project path to repo URL
         repo_url = project_to_repo_url(project)
@@ -1547,43 +1553,154 @@ def run_cleanup(config, tag=None, dry_run=False):
     else:
         logging.info("Cleanup completed")
 
-def push_all_operations(operations, sorted_repos):
+def compute_dependency_waves(dependency_graph, sorted_repos):
+    """
+    Group repos into waves based on dependency depth.
+    Wave 0 = leaf repos (no in-config dependencies)
+    Wave N = repos that depend only on repos in waves 0 to N-1
+    """
+    waves = []
+    assigned = set()
+    remaining = set(sorted_repos)
+
+    while remaining:
+        # Find repos whose dependencies are all assigned to previous waves
+        current_wave = []
+        for repo_url in remaining:
+            deps = dependency_graph.get(repo_url, [])
+            if all(dep in assigned for dep in deps):
+                current_wave.append(repo_url)
+
+        if not current_wave:
+            # Cycle or missing dependency (shouldn't happen after topo sort)
+            logging.error("Cannot compute waves - circular dependency?")
+            break
+
+        waves.append(current_wave)
+        assigned.update(current_wave)
+        remaining -= set(current_wave)
+
+    return waves
+
+
+def verify_tag_exists(repo_url, tag, max_retries=3, retry_delay=2):
+    """
+    Verify a tag exists on GitLab via API.
+    Retries a few times in case of propagation delay.
+    """
+    token, api_url = get_gitlab_credentials()
+    if not token:
+        logging.warning("No GitLab token - skipping tag verification")
+        return True  # Assume success if we can't verify
+
+    project_id = get_gitlab_project_id(repo_url)
+    if not project_id:
+        return True  # Assume success
+
+    # URL-encode the tag name for the API
+    import urllib.parse
+    encoded_tag = urllib.parse.quote(tag, safe='')
+    url = f"{api_url}/projects/{project_id}/repository/tags/{encoded_tag}"
+    headers = {"PRIVATE-TOKEN": token}
+
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, headers=headers)
+            if response.status_code == 200:
+                logging.debug(f"Verified tag '{tag}' exists on '{get_repo_name(repo_url)}'")
+                return True
+            elif response.status_code == 404:
+                if attempt < max_retries - 1:
+                    logging.debug(f"Tag '{tag}' not found yet, retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                continue
+        except Exception as e:
+            logging.warning(f"Error verifying tag: {e}")
+
+    logging.warning(f"Could not verify tag '{tag}' on '{get_repo_name(repo_url)}' after {max_retries} attempts")
+    return False
+
+
+def push_tags_in_waves(operations, dependency_graph, sorted_repos):
+    """
+    Push tags in dependency waves, verifying each wave before proceeding.
+    This ensures parent repo tags are indexed before dependent repos' CI runs.
+    """
+    waves = compute_dependency_waves(dependency_graph, sorted_repos)
+
+    # Count how many waves have tags
+    waves_with_tags = sum(1 for wave in waves if any(
+        r in operations and operations[r].tag_to_create for r in wave))
+
+    if waves_with_tags == 0:
+        logging.debug("No tags to push")
+        return
+
+    logging.info(f"Pushing tags in {waves_with_tags} wave(s)")
+
+    for wave_num, wave_repos in enumerate(waves):
+        wave_tags = [(r, operations[r].tag_to_create)
+                     for r in wave_repos
+                     if r in operations and operations[r].tag_to_create]
+
+        if not wave_tags:
+            continue
+
+        wave_repo_names = [get_repo_name(r) for r, _ in wave_tags]
+        logging.info(f"Wave {wave_num + 1}: Pushing tags for {wave_repo_names}")
+
+        # Push all tags in this wave
+        for repo_url, tag in wave_tags:
+            push_tag(operations[repo_url].repo_object, repo_url, tag)
+
+        # Verify tags are indexed before next wave (skip for last wave)
+        if wave_num < len(waves) - 1:
+            # Check if there are more waves with tags
+            remaining_waves_have_tags = any(
+                any(r in operations and operations[r].tag_to_create for r in waves[i])
+                for i in range(wave_num + 1, len(waves))
+            )
+            if remaining_waves_have_tags:
+                logging.info(f"Verifying wave {wave_num + 1} tags are indexed...")
+                for repo_url, tag in wave_tags:
+                    verify_tag_exists(repo_url, tag)
+
+
+def push_all_operations(operations, dependency_graph, sorted_repos):
     """Phase 2: Push all operations to remote in topological order."""
     logging.info("=" * 60)
     logging.info("PHASE 2: Pushing all changes to remote repositories")
     logging.info("=" * 60)
-    
+
     push_failures = []
-    
-    # Push in topological order to ensure dependencies are available
+
+    # Push tags first in dependency waves (ensures submodule commits are indexed)
+    push_tags_in_waves(operations, dependency_graph, sorted_repos)
+
+    # Then push branches and create MRs (in topological order)
     for repo_url in sorted_repos:
         if repo_url not in operations:
             continue
-            
+
         operation = operations[repo_url]
         if not operation.success:
             continue
 
-        # Skip if no branch and no tag to push
-        if not operation.branch_name and not operation.tag_to_create:
+        # Skip if no branch to push (tags already handled above)
+        if not operation.branch_name:
             continue
 
-        logging.info(f"Pushing changes for '{get_repo_name(repo_url)}'...")
+        logging.info(f"Pushing branch for '{get_repo_name(repo_url)}'...")
 
         try:
             repo = operation.repo_object
             settings = operation.settings
 
             # Push the branch and create MR
-            if operation.branch_name:
-                automerge = settings.get('automerge', False)
-                create_mr = settings.get('create_merge_request', True)
-                push_branch(repo, repo_url, operation.branch_name, settings, automerge, create_mr, dry_run=False)
+            automerge = settings.get('automerge', False)
+            create_mr = settings.get('create_merge_request', True)
+            push_branch(repo, repo_url, operation.branch_name, settings, automerge, create_mr, dry_run=False)
 
-            # Push tag (already created locally in Phase 1)
-            if operation.tag_to_create:
-                push_tag(repo, repo_url, operation.tag_to_create)
-                
         except Exception as e:
             logging.error(f"Failed to push changes for '{repo_url}': {e}")
             push_failures.append(repo_url)
@@ -1726,7 +1843,7 @@ def main():
     # ========================================================================
     # PHASE 2: Push to Remote (in topological order)
     # ========================================================================
-    success = push_all_operations(operations, sorted_repos)
+    success = push_all_operations(operations, dependency_graph, sorted_repos)
     
     if success:
         logging.info("=" * 60)
