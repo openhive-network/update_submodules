@@ -830,10 +830,17 @@ def fetch_updates(repo, repo_url):
         sys.exit(1)
 
 def checkout_reference(repo, repo_url, desired_ref_actual):
-    """Checkout the desired reference in the repository."""
+    """Checkout the desired reference in the repository and ensure it's up-to-date with origin."""
     try:
         repo.git.checkout(desired_ref_actual)
         logging.debug(f"Checked out '{desired_ref_actual}' in '{get_repo_name(repo_url)}'.")
+        # Reset local branch to match origin to ensure we're on the latest commit
+        try:
+            repo.git.reset('--hard', f'origin/{desired_ref_actual}')
+            logging.debug(f"Reset '{desired_ref_actual}' to 'origin/{desired_ref_actual}' in '{get_repo_name(repo_url)}'.")
+        except GitCommandError:
+            # If origin/ref doesn't exist (e.g., for tags or commits), that's OK
+            logging.debug(f"Could not reset to 'origin/{desired_ref_actual}' (may be a tag or commit), continuing.")
     except GitCommandError:
         logging.warning(f"Reference '{desired_ref_actual}' not found in '{repo_url}'. Attempting to create it from 'origin/{desired_ref_actual}'.")
         try:
