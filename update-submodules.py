@@ -2,6 +2,7 @@
 
 import os
 import sys
+import time
 import yaml
 import git
 import argparse
@@ -12,7 +13,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, List
 from collections import defaultdict
 from ruamel.yaml import YAML
-from git import Repo, GitCommandError
+from git import Repo, GitCommandError, PushInfo
 
 # Configuration
 CONFIG_FILE = 'repos.yaml'
@@ -63,6 +64,7 @@ def parse_arguments():
     parser.add_argument('--retag', '-r', action='store_true', help='Overwrite existing tags with the same name when using --tag.')
     parser.add_argument('--cleanup', action='store_true', help='Clean up branches, tags, and MRs from a previous failed run.')
     parser.add_argument('--cleanup-tag', type=str, help='Specific tag to clean up when using --cleanup.')
+    parser.add_argument('--push-delay', type=int, default=15, help='Delay in seconds between pushing to each repository (default: 15). Set to 0 to disable.')
     return parser.parse_args()
 
 def get_gitlab_credentials():
@@ -1102,6 +1104,13 @@ def create_tag_locally(repo, repo_url, tag, retag):
         logging.error(f"Failed to create tag '{tag}' in '{repo_url}': {e}")
         sys.exit(1)
 
+def _check_push_result(push_info_list, repo_url, ref_name):
+    """Check PushInfoList for errors. Raises GitCommandError if push was rejected."""
+    for info in push_info_list:
+        if info.flags & (PushInfo.ERROR | PushInfo.REJECTED | PushInfo.REMOTE_REJECTED | PushInfo.REMOTE_FAILURE):
+            summary = info.summary if hasattr(info, 'summary') else 'push rejected'
+            raise GitCommandError(f"push {ref_name}", 2, stderr=summary)
+
 def push_tag(repo, repo_url, tag):
     """Push a tag to remote (Phase 2 operation)."""
     if not tag:
@@ -1110,20 +1119,23 @@ def push_tag(repo, repo_url, tag):
     # Check if remote tag needs to be deleted first (for retag)
     try:
         # Try to push the tag
-        repo.remotes.origin.push(tag)
+        result = repo.remotes.origin.push(tag)
+        _check_push_result(result, repo_url, tag)
         logging.info(f"Pushed tag '{tag}' to '{repo_url}'.")
     except GitCommandError as e:
         # If push fails, it might be because the tag already exists on remote
-        if "already exists" in str(e) or "cannot lock ref" in str(e):
+        if "already exists" in str(e) or "cannot lock ref" in str(e) or "rejected" in str(e).lower():
             logging.info(f"Tag '{tag}' already exists on remote, attempting to delete and repush...")
 
             # Try to delete remote tag via Git first
             try:
-                repo.remotes.origin.push(refspec=f":refs/tags/{tag}")
+                delete_result = repo.remotes.origin.push(refspec=f":refs/tags/{tag}")
+                _check_push_result(delete_result, repo_url, f":refs/tags/{tag}")
                 logging.debug(f"Deleted remote tag '{tag}' via Git")
 
                 # Now try to push again
-                repo.remotes.origin.push(tag)
+                result = repo.remotes.origin.push(tag)
+                _check_push_result(result, repo_url, tag)
                 logging.info(f"Pushed tag '{tag}' to '{repo_url}' after deleting existing remote tag.")
             except GitCommandError as delete_error:
                 # If Git push fails (likely protected tag), try API
@@ -1131,7 +1143,8 @@ def push_tag(repo, repo_url, tag):
                 if delete_gitlab_tag_via_api(repo_url, tag):
                     # Try to push again after API deletion
                     try:
-                        repo.remotes.origin.push(tag)
+                        result = repo.remotes.origin.push(tag)
+                        _check_push_result(result, repo_url, tag)
                         logging.info(f"Pushed tag '{tag}' to '{repo_url}' after deleting via API.")
                     except GitCommandError as push_error:
                         logging.error(f"Failed to push tag '{tag}' even after deletion: {push_error}")
@@ -1340,19 +1353,27 @@ def run_cleanup(config, tag=None, dry_run=False):
     else:
         logging.info("Cleanup completed")
 
-def push_all_operations(operations, sorted_repos):
+def push_all_operations(operations, sorted_repos, push_delay=15):
     """Phase 2: Push all operations to remote in topological order."""
     logging.info("=" * 60)
     logging.info("PHASE 2: Pushing all changes to remote repositories")
     logging.info("=" * 60)
     
     push_failures = []
-    
+
+    # Count repos that will be pushed to for delay logic
+    repos_to_push = [url for url in sorted_repos
+                     if url in operations
+                     and operations[url].success
+                     and (operations[url].branch_name or operations[url].tag_to_create)]
+    total_repos = len(repos_to_push)
+    current_repo = 0
+
     # Push in topological order to ensure dependencies are available
     for repo_url in sorted_repos:
         if repo_url not in operations:
             continue
-            
+
         operation = operations[repo_url]
         if not operation.success:
             continue
@@ -1361,6 +1382,7 @@ def push_all_operations(operations, sorted_repos):
         if not operation.branch_name and not operation.tag_to_create:
             continue
 
+        current_repo += 1
         logging.info(f"Pushing changes for '{get_repo_name(repo_url)}'...")
 
         try:
@@ -1376,11 +1398,16 @@ def push_all_operations(operations, sorted_repos):
             # Push tag (already created locally in Phase 1)
             if operation.tag_to_create:
                 push_tag(repo, repo_url, operation.tag_to_create)
-                
+
+            # Delay between pushes to stagger pipeline starts (skip after last repo)
+            if push_delay > 0 and current_repo < total_repos:
+                logging.info(f"Waiting {push_delay}s before next push ({current_repo}/{total_repos})...")
+                time.sleep(push_delay)
+
         except Exception as e:
             logging.error(f"Failed to push changes for '{repo_url}': {e}")
             push_failures.append(repo_url)
-            
+
     if push_failures:
         logging.error(f"Failed to push changes for the following repositories: {push_failures}")
         logging.error("You may need to manually push these or run with --cleanup to reset")
@@ -1510,7 +1537,7 @@ def main():
     # ========================================================================
     # PHASE 2: Push to Remote (in topological order)
     # ========================================================================
-    success = push_all_operations(operations, sorted_repos)
+    success = push_all_operations(operations, sorted_repos, args.push_delay)
     
     if success:
         logging.info("=" * 60)
