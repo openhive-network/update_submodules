@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, List
 from collections import defaultdict
 from ruamel.yaml import YAML
-from git import Repo, GitCommandError
+from git import Repo, GitCommandError, PushInfo
 
 # Configuration
 CONFIG_FILE = 'repos.yaml'
@@ -64,6 +64,7 @@ def parse_arguments():
     parser.add_argument('--retag', '-r', action='store_true', help='Overwrite existing tags with the same name when using --tag.')
     parser.add_argument('--cleanup', action='store_true', help='Clean up branches, tags, and MRs from a previous failed run.')
     parser.add_argument('--cleanup-tag', type=str, help='Specific tag to clean up when using --cleanup.')
+    parser.add_argument('--push-delay', type=int, default=15, help='Delay in seconds between pushing to each repository (default: 15). Set to 0 to disable.')
     return parser.parse_args()
 
 def get_gitlab_credentials():
@@ -1241,10 +1242,10 @@ def push_branch(repo, repo_url, branch_name, settings, automerge, create_mr, dry
             push_options = create_merge_request(repo, branch_name, target_branch, automerge=automerge)
             logging.debug(f"Pushing branch '{branch_name}' with push options: {push_options}")
             # Pass push_options as a single string within a list
-            repo.remotes.origin.push(refspec=f"{branch_name}:{branch_name}", push_option=push_options)
+            repo.remotes.origin.push(refspec=f"{branch_name}:{branch_name}", push_option=push_options, recurse_submodules='no')
             logging.info(f"Pushed branch '{branch_name}' to '{repo_url}' with push options for merge request targeting '{target_branch}'.")
         else:
-            repo.remotes.origin.push(refspec=f"{branch_name}:{branch_name}")
+            repo.remotes.origin.push(refspec=f"{branch_name}:{branch_name}", recurse_submodules='no')
             logging.info(f"Pushed branch '{branch_name}' to '{repo_url}'.")
     except GitCommandError as e:
         logging.error(f"Failed to push branch '{branch_name}' to '{repo_url}': {e}")
@@ -1340,6 +1341,13 @@ def create_tag_locally(repo, repo_url, tag, retag):
         logging.error(f"Failed to create tag '{tag}' in '{repo_url}': {e}")
         sys.exit(1)
 
+def _check_push_result(push_info_list, repo_url, ref_name):
+    """Check PushInfoList for errors. Raises GitCommandError if push was rejected."""
+    for info in push_info_list:
+        if info.flags & (PushInfo.ERROR | PushInfo.REJECTED | PushInfo.REMOTE_REJECTED | PushInfo.REMOTE_FAILURE):
+            summary = info.summary if hasattr(info, 'summary') else 'push rejected'
+            raise GitCommandError(f"push {ref_name}", 2, stderr=summary)
+
 def push_tag(repo, repo_url, tag):
     """Push a tag to remote (Phase 2 operation)."""
     if not tag:
@@ -1347,21 +1355,24 @@ def push_tag(repo, repo_url, tag):
 
     # Check if remote tag needs to be deleted first (for retag)
     try:
-        # Try to push the tag
-        repo.remotes.origin.push(tag)
+        # Try to push the tag (--no-recurse-submodules avoids pushing into submodule checkouts)
+        result = repo.remotes.origin.push(tag, recurse_submodules='no')
+        _check_push_result(result, repo_url, tag)
         logging.info(f"Pushed tag '{tag}' to '{repo_url}'.")
     except GitCommandError as e:
         # If push fails, it might be because the tag already exists on remote
-        if "already exists" in str(e) or "cannot lock ref" in str(e):
+        if "already exists" in str(e) or "cannot lock ref" in str(e) or "rejected" in str(e).lower():
             logging.info(f"Tag '{tag}' already exists on remote, attempting to delete and repush...")
 
             # Try to delete remote tag via Git first
             try:
-                repo.remotes.origin.push(refspec=f":refs/tags/{tag}")
+                delete_result = repo.remotes.origin.push(refspec=f":refs/tags/{tag}", recurse_submodules='no')
+                _check_push_result(delete_result, repo_url, f":refs/tags/{tag}")
                 logging.debug(f"Deleted remote tag '{tag}' via Git")
 
                 # Now try to push again
-                repo.remotes.origin.push(tag)
+                result = repo.remotes.origin.push(tag, recurse_submodules='no')
+                _check_push_result(result, repo_url, tag)
                 logging.info(f"Pushed tag '{tag}' to '{repo_url}' after deleting existing remote tag.")
             except GitCommandError as delete_error:
                 # If Git push fails (likely protected tag), try API
@@ -1369,7 +1380,8 @@ def push_tag(repo, repo_url, tag):
                 if delete_gitlab_tag_via_api(repo_url, tag):
                     # Try to push again after API deletion
                     try:
-                        repo.remotes.origin.push(tag)
+                        result = repo.remotes.origin.push(tag, recurse_submodules='no')
+                        _check_push_result(result, repo_url, tag)
                         logging.info(f"Pushed tag '{tag}' to '{repo_url}' after deleting via API.")
                     except GitCommandError as push_error:
                         logging.error(f"Failed to push tag '{tag}' even after deletion: {push_error}")
@@ -1532,7 +1544,7 @@ def run_cleanup(config, tag=None, dry_run=False):
                         logging.info(f"Would delete remote branch '{ref.remote_head}' in '{get_repo_name(repo_url)}'")
                     else:
                         try:
-                            repo.remotes.origin.push(refspec=f":{ref.remote_head}")
+                            repo.remotes.origin.push(refspec=f":{ref.remote_head}", recurse_submodules='no')
                             logging.info(f"Deleted remote branch '{ref.remote_head}' in '{get_repo_name(repo_url)}'")
                         except GitCommandError as e:
                             logging.warning(f"Could not delete remote branch '{ref.remote_head}': {e}")
@@ -1561,7 +1573,7 @@ def run_cleanup(config, tag=None, dry_run=False):
                         pass
                 else:
                     try:
-                        repo.remotes.origin.push(refspec=f":refs/tags/{tag}")
+                        repo.remotes.origin.push(refspec=f":refs/tags/{tag}", recurse_submodules='no')
                         logging.info(f"Deleted remote tag '{tag}' in '{get_repo_name(repo_url)}'")
                     except GitCommandError:
                         # Try API for protected tags
@@ -1729,7 +1741,7 @@ def push_all_operations(operations, dependency_graph, sorted_repos):
         except Exception as e:
             logging.error(f"Failed to push changes for '{repo_url}': {e}")
             push_failures.append(repo_url)
-            
+
     if push_failures:
         logging.error(f"Failed to push changes for the following repositories: {push_failures}")
         logging.error("You may need to manually push these or run with --cleanup to reset")
