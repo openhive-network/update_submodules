@@ -1035,10 +1035,10 @@ def push_branch(repo, repo_url, branch_name, settings, automerge, create_mr, dry
             push_options = create_merge_request(repo, branch_name, target_branch, automerge=automerge)
             logging.debug(f"Pushing branch '{branch_name}' with push options: {push_options}")
             # Pass push_options as a single string within a list
-            repo.remotes.origin.push(refspec=f"{branch_name}:{branch_name}", push_option=push_options)
+            repo.remotes.origin.push(refspec=f"{branch_name}:{branch_name}", push_option=push_options, recurse_submodules='no')
             logging.info(f"Pushed branch '{branch_name}' to '{repo_url}' with push options for merge request targeting '{target_branch}'.")
         else:
-            repo.remotes.origin.push(refspec=f"{branch_name}:{branch_name}")
+            repo.remotes.origin.push(refspec=f"{branch_name}:{branch_name}", recurse_submodules='no')
             logging.info(f"Pushed branch '{branch_name}' to '{repo_url}'.")
     except GitCommandError as e:
         logging.error(f"Failed to push branch '{branch_name}' to '{repo_url}': {e}")
@@ -1118,8 +1118,8 @@ def push_tag(repo, repo_url, tag):
 
     # Check if remote tag needs to be deleted first (for retag)
     try:
-        # Try to push the tag
-        result = repo.remotes.origin.push(tag)
+        # Try to push the tag (--no-recurse-submodules avoids pushing into submodule checkouts)
+        result = repo.remotes.origin.push(tag, recurse_submodules='no')
         _check_push_result(result, repo_url, tag)
         logging.info(f"Pushed tag '{tag}' to '{repo_url}'.")
     except GitCommandError as e:
@@ -1129,12 +1129,12 @@ def push_tag(repo, repo_url, tag):
 
             # Try to delete remote tag via Git first
             try:
-                delete_result = repo.remotes.origin.push(refspec=f":refs/tags/{tag}")
+                delete_result = repo.remotes.origin.push(refspec=f":refs/tags/{tag}", recurse_submodules='no')
                 _check_push_result(delete_result, repo_url, f":refs/tags/{tag}")
                 logging.debug(f"Deleted remote tag '{tag}' via Git")
 
                 # Now try to push again
-                result = repo.remotes.origin.push(tag)
+                result = repo.remotes.origin.push(tag, recurse_submodules='no')
                 _check_push_result(result, repo_url, tag)
                 logging.info(f"Pushed tag '{tag}' to '{repo_url}' after deleting existing remote tag.")
             except GitCommandError as delete_error:
@@ -1143,7 +1143,7 @@ def push_tag(repo, repo_url, tag):
                 if delete_gitlab_tag_via_api(repo_url, tag):
                     # Try to push again after API deletion
                     try:
-                        result = repo.remotes.origin.push(tag)
+                        result = repo.remotes.origin.push(tag, recurse_submodules='no')
                         _check_push_result(result, repo_url, tag)
                         logging.info(f"Pushed tag '{tag}' to '{repo_url}' after deleting via API.")
                     except GitCommandError as push_error:
@@ -1307,7 +1307,7 @@ def run_cleanup(config, tag=None, dry_run=False):
                         logging.info(f"Would delete remote branch '{ref.remote_head}' in '{get_repo_name(repo_url)}'")
                     else:
                         try:
-                            repo.remotes.origin.push(refspec=f":{ref.remote_head}")
+                            repo.remotes.origin.push(refspec=f":{ref.remote_head}", recurse_submodules='no')
                             logging.info(f"Deleted remote branch '{ref.remote_head}' in '{get_repo_name(repo_url)}'")
                         except GitCommandError as e:
                             logging.warning(f"Could not delete remote branch '{ref.remote_head}': {e}")
@@ -1336,7 +1336,7 @@ def run_cleanup(config, tag=None, dry_run=False):
                         pass
                 else:
                     try:
-                        repo.remotes.origin.push(refspec=f":refs/tags/{tag}")
+                        repo.remotes.origin.push(refspec=f":refs/tags/{tag}", recurse_submodules='no')
                         logging.info(f"Deleted remote tag '{tag}' in '{get_repo_name(repo_url)}'")
                     except GitCommandError:
                         # Try API for protected tags
