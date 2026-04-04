@@ -204,8 +204,8 @@ def validate_config(config):
                 if not isinstance(edit, dict):
                     logging.error(f"Each entry in 'update_yaml' for repository '{repo_url}' must be a dictionary.")
                     sys.exit(1)
-                if 'filename' not in edit or 'key_to_update' not in edit or 'submodule_referenced' not in edit:
-                    logging.error(f"Each 'update_yaml' entry for repository '{repo_url}' must contain 'filename', 'key_to_update', and 'submodule_referenced'.")
+                if 'filename' not in edit or 'key_to_update' not in edit:
+                    logging.error(f"Each 'update_yaml' entry for repository '{repo_url}' must contain 'filename' and 'key_to_update'.")
                     sys.exit(1)
                 if not isinstance(edit['filename'], str) or not edit['filename'].strip():
                     logging.error(f"Invalid 'filename' in 'update_yaml' for repository '{repo_url}'.")
@@ -213,8 +213,21 @@ def validate_config(config):
                 if not isinstance(edit['key_to_update'], str) or not edit['key_to_update'].strip():
                     logging.error(f"Invalid 'key_to_update' in 'update_yaml' for repository '{repo_url}'.")
                     sys.exit(1)
-                if not isinstance(edit['submodule_referenced'], str) or not edit['submodule_referenced'].strip():
+                # Entries must have 'submodule_referenced', 'value', or 'action: remove'
+                action = edit.get('action')
+                has_value = 'value' in edit
+                has_submodule = 'submodule_referenced' in edit
+                if not has_submodule and not has_value and action != 'remove':
+                    logging.error(f"'update_yaml' entry in '{repo_url}' must have 'submodule_referenced', 'value', or 'action: remove'.")
+                    sys.exit(1)
+                if has_submodule and (not isinstance(edit['submodule_referenced'], str) or not edit['submodule_referenced'].strip()):
                     logging.error(f"Invalid 'submodule_referenced' in 'update_yaml' for repository '{repo_url}'.")
+                    sys.exit(1)
+                if action is not None and action != 'remove':
+                    logging.error(f"Invalid 'action' value '{action}' in 'update_yaml' for repository '{repo_url}'. Only 'remove' is supported.")
+                    sys.exit(1)
+                if 'when' in edit and edit['when'] != 'tag':
+                    logging.error(f"Invalid 'when' value '{edit['when']}' in 'update_yaml' for repository '{repo_url}'. Only 'tag' is supported.")
                     sys.exit(1)
     logging.info("Configuration validation passed.")
 
@@ -384,6 +397,10 @@ def project_to_repo_url(project_path):
     """Convert a GitLab project path (e.g., 'hive/common-ci-configuration') to a repo URL."""
     return f"git@gitlab.syncad.com:{project_path}.git"
 
+def _looks_like_sha(ref):
+    """Return True if ref looks like a hex commit SHA (7-40 hex chars)."""
+    return len(ref) >= 7 and all(c in '0123456789abcdef' for c in ref.lower())
+
 def detect_ci_includes(clone_path):
     """
     Detect CI includes from a repository's .gitlab-ci.yml or .gitlab-ci.yaml file.
@@ -393,6 +410,7 @@ def detect_ci_includes(clone_path):
     """
     yaml_obj = YAML()
     yaml_obj.preserve_quotes = True
+    yaml_obj.allow_duplicate_keys = True
 
     # Try both possible CI file names
     ci_files = ['.gitlab-ci.yml', '.gitlab-ci.yaml']
@@ -467,9 +485,11 @@ def collect_auto_detected_yaml_updates(clone_path, config, updated_repos_commits
         current_ref = include['ref']
         idx = include['index']
 
-        # Skip common-ci-configuration - repos expect ref: develop for dynamic templates
-        if project == 'hive/common-ci-configuration':
-            logging.debug(f"Skipping CI include for {project} - should remain dynamic")
+        # Skip common-ci-configuration includes that use a branch name (e.g. 'develop')
+        # since those are intentionally dynamic. But if the ref is already pinned to a
+        # commit SHA, update it like any other include so it stays in sync with submodules.
+        if project == 'hive/common-ci-configuration' and not _looks_like_sha(current_ref):
+            logging.debug(f"Skipping CI include for {project} - ref '{current_ref}' is dynamic")
             continue
 
         # Convert project path to repo URL
@@ -645,24 +665,27 @@ def validate_yaml_operations(config):
             
         for edit in update_yaml_entries:
             yaml_path = os.path.join(clone_path, edit['filename'])
-            
+            action = edit.get('action')
+            is_remove = action == 'remove'
+            is_value = 'value' in edit
+
             # Check if file exists
             if not os.path.exists(yaml_path):
                 errors.append(f"YAML file '{edit['filename']}' not found in repository '{repo_url}'")
                 continue
-                
+
             # Try to load and validate the YAML file
             try:
                 yaml_obj = YAML()
                 yaml_obj.preserve_quotes = True
                 with open(yaml_path, 'r') as f:
                     data = yaml_obj.load(f)
-                    
+
                 # Validate key path exists
                 key_to_update = edit['key_to_update']
                 keys = key_to_update.split('.')
                 current = data
-                
+
                 try:
                     for key in keys[:-1]:
                         if '[' in key and ']' in key:
@@ -670,38 +693,55 @@ def validate_yaml_operations(config):
                             list_key, condition = key.split('[', 1)
                             condition = condition.rstrip(']')
                             field, value = condition.split('=', 1)
-                            
+
                             if list_key not in current or not isinstance(current[list_key], list):
-                                errors.append(f"Key '{list_key}' is not a list in YAML file '{edit['filename']}' in repository '{repo_url}'")
+                                if is_remove:
+                                    warnings.append(f"Key '{list_key}' not found for removal in '{edit['filename']}' in '{repo_url}' (will be skipped)")
+                                else:
+                                    errors.append(f"Key '{list_key}' is not a list in YAML file '{edit['filename']}' in repository '{repo_url}'")
                                 raise KeyError
-                                
+
                             # Find matching item
                             matched_item = None
                             for item in current[list_key]:
                                 if isinstance(item, dict) and item.get(field) == value:
                                     matched_item = item
                                     break
-                                    
+
                             if not matched_item:
-                                errors.append(f"No item found in list '{list_key}' with condition '{field}={value}' in YAML file '{edit['filename']}' in repository '{repo_url}'")
+                                if is_remove:
+                                    warnings.append(f"No item found for removal condition '{field}={value}' in '{edit['filename']}' in '{repo_url}' (will be skipped)")
+                                else:
+                                    errors.append(f"No item found in list '{list_key}' with condition '{field}={value}' in YAML file '{edit['filename']}' in repository '{repo_url}'")
                                 raise KeyError
-                                
+
                             current = matched_item
                         else:
                             if key not in current:
-                                errors.append(f"Key '{key}' not found in path '{key_to_update}' in YAML file '{edit['filename']}' in repository '{repo_url}'")
-                                raise KeyError
+                                if is_remove:
+                                    warnings.append(f"Key '{key}' not found for removal in path '{key_to_update}' in '{edit['filename']}' in '{repo_url}' (will be skipped)")
+                                    raise KeyError
+                                elif is_value:
+                                    # Will be created during update
+                                    warnings.append(f"Key '{key}' not found in path '{key_to_update}' in YAML file '{edit['filename']}' in repository '{repo_url}' (will be created)")
+                                    raise KeyError
+                                else:
+                                    errors.append(f"Key '{key}' not found in path '{key_to_update}' in YAML file '{edit['filename']}' in repository '{repo_url}'")
+                                    raise KeyError
                             current = current[key]
-                            
+
                     # Check last key exists
                     last_key = keys[-1]
                     if last_key not in current:
-                        warnings.append(f"Key '{last_key}' not found in path '{key_to_update}' in YAML file '{edit['filename']}' in repository '{repo_url}' (will be created)")
-                        
+                        if is_remove:
+                            warnings.append(f"Key '{last_key}' not found for removal in '{key_to_update}' in '{edit['filename']}' in '{repo_url}' (will be skipped)")
+                        else:
+                            warnings.append(f"Key '{last_key}' not found in path '{key_to_update}' in YAML file '{edit['filename']}' in repository '{repo_url}' (will be created)")
+
                 except KeyError:
                     # Error already added above
                     pass
-                    
+
             except Exception as e:
                 errors.append(f"Failed to validate YAML file '{edit['filename']}' in repository '{repo_url}': {e}")
                 
@@ -895,10 +935,15 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
     # Auto-detect CI include updates (regardless of submodule updates)
     auto_detected_yaml_updates = collect_auto_detected_yaml_updates(clone_path, config, updated_repos_commits)
 
+    # Collect manual YAML file updates (from config) — includes standalone entries
+    # that don't depend on submodule changes (e.g., value or action: remove entries)
+    manual_yaml_updates = collect_yaml_updates(settings, updated_submodules, tag_name=tag)
+
     # Determine if we have any updates to make
     has_submodule_updates = bool(updated_submodules)
     has_ci_include_updates = bool(auto_detected_yaml_updates)
-    has_any_updates = has_submodule_updates or has_ci_include_updates
+    has_manual_yaml_updates = bool(manual_yaml_updates)
+    has_any_updates = has_submodule_updates or has_ci_include_updates or has_manual_yaml_updates
 
     if has_any_updates:
         # Create a feature branch for the updates (always create in Phase 1)
@@ -906,9 +951,6 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
         result.branch_name = branch_name
 
         if branch_name:
-            # Collect manual YAML file updates based on submodule updates (from config)
-            manual_yaml_updates = collect_yaml_updates(settings, updated_submodules) if has_submodule_updates else {}
-
             # Merge manual and auto-detected YAML updates
             updated_yaml_files = merge_yaml_updates(manual_yaml_updates, auto_detected_yaml_updates)
             result.yaml_files_updated = updated_yaml_files
@@ -1216,6 +1258,23 @@ def commit_changes_extended(repo, repo_url, updated_submodules, updated_yaml_fil
         for project in sorted(set(ci_include_updates)):
             commit_lines.append(f" - {project}")
 
+    # Add manual YAML updates (value/remove entries) to commit message
+    manual_yaml_updates = []
+    for filename, edits in updated_yaml_files.items():
+        for edit in edits:
+            if edit.get('auto_detected'):
+                continue  # Already handled above
+            if edit.get('action') == 'remove':
+                manual_yaml_updates.append(f" - {filename}: removed {edit['key_to_update']}")
+            elif 'value' in edit:
+                manual_yaml_updates.append(f" - {filename}: set {edit['key_to_update']} to '{edit['value']}'")
+
+    if manual_yaml_updates:
+        if commit_lines:
+            commit_lines.append("")
+        commit_lines.append("Update CI variables:")
+        commit_lines.extend(manual_yaml_updates)
+
     if not commit_lines:
         commit_lines.append("Update dependencies")
 
@@ -1251,23 +1310,51 @@ def push_branch(repo, repo_url, branch_name, settings, automerge, create_mr, dry
         logging.error(f"Failed to push branch '{branch_name}' to '{repo_url}': {e}")
         sys.exit(1)
 
-def collect_yaml_updates(current_repo_settings, updated_submodules):
-    """Collect YAML file updates based on submodule updates for the current repository."""
+def collect_yaml_updates(current_repo_settings, updated_submodules, tag_name=None):
+    """Collect YAML file updates based on submodule updates and standalone entries.
+
+    Handles three types of entries:
+    - submodule_referenced: triggered when the referenced submodule was updated
+    - value: standalone entry with a literal value ($TAG is substituted with tag_name)
+    - action: remove: standalone entry that removes a YAML key
+
+    Entries with 'when: tag' are skipped if tag_name is None.
+    """
     updated_yaml_files = {}
     update_yaml_entries = current_repo_settings.get('update_yaml', [])
     for edit in update_yaml_entries:
-        # The 'submodule_referenced' should be an absolute URL as per the config
-        submodule_referenced_url = edit['submodule_referenced']
-        if submodule_referenced_url in updated_submodules:
-            filename = edit['filename']
-            key_to_update = edit['key_to_update']
-            if filename not in updated_yaml_files:
-                updated_yaml_files[filename] = []
-            updated_yaml_files[filename].append({
-                'filename': filename,  # Ensure 'filename' is included
-                'key_to_update': key_to_update,
-                'submodule_referenced': submodule_referenced_url  # Use absolute URL
-            })
+        # Check 'when' condition
+        if edit.get('when') == 'tag' and not tag_name:
+            continue
+
+        filename = edit['filename']
+        key_to_update = edit['key_to_update']
+        entry = {
+            'filename': filename,
+            'key_to_update': key_to_update,
+        }
+
+        if edit.get('action') == 'remove':
+            # Standalone remove entry — always include (no submodule dependency)
+            entry['action'] = 'remove'
+        elif 'value' in edit:
+            # Standalone value entry — substitute $TAG and include
+            value = edit['value']
+            if tag_name:
+                value = value.replace('$TAG', tag_name)
+            entry['value'] = value
+        elif 'submodule_referenced' in edit:
+            # Submodule-dependent entry — only include if submodule was updated
+            submodule_referenced_url = edit['submodule_referenced']
+            if submodule_referenced_url not in updated_submodules:
+                continue
+            entry['submodule_referenced'] = submodule_referenced_url
+        else:
+            continue
+
+        if filename not in updated_yaml_files:
+            updated_yaml_files[filename] = []
+        updated_yaml_files[filename].append(entry)
     return updated_yaml_files
 
 def merge_yaml_updates(manual_updates, auto_detected_updates):
@@ -1418,8 +1505,13 @@ def log_commit_summary(repo_url, updated_submodules, updated_yaml_files, push_en
         commit_lines.append("Update YAML files:")
         for filename, edits in updated_yaml_files.items():
             for edit in edits:
-                submodule_name = get_repo_name(edit['submodule_referenced'])
-                commit_lines.append(f" - {filename}: {edit['key_to_update']} updated for submodule '{submodule_name}'")
+                if edit.get('action') == 'remove':
+                    commit_lines.append(f" - {filename}: {edit['key_to_update']} removed")
+                elif 'value' in edit:
+                    commit_lines.append(f" - {filename}: {edit['key_to_update']} set to '{edit['value']}'")
+                elif 'submodule_referenced' in edit:
+                    submodule_name = get_repo_name(edit['submodule_referenced'])
+                    commit_lines.append(f" - {filename}: {edit['key_to_update']} updated for submodule '{submodule_name}'")
 
     commit_message = "\n".join(commit_lines)
     logging.info(f"Commit summary for '{get_repo_name(repo_url)}':\n{commit_message}")
@@ -1429,20 +1521,67 @@ def log_commit_summary(repo_url, updated_submodules, updated_yaml_files, push_en
     else:
         logging.info("Phase 2: Changes pushed to remote")
 
+def _traverse_yaml_key_path(data, key_to_update, yaml_path):
+    """Traverse a dotted key path in YAML data, returning (parent_dict, last_key).
+
+    Supports conditional list matching, e.g., 'include[project=C].ref'.
+    Creates intermediate dicts as needed for set operations.
+    Raises KeyError if path cannot be traversed.
+    """
+    keys = key_to_update.split('.')
+    current = data
+    for key in keys[:-1]:
+        if '[' in key and ']' in key:
+            list_key, condition = key.split('[', 1)
+            condition = condition.rstrip(']')
+            field, value = condition.split('=', 1)
+            if list_key not in current or not isinstance(current[list_key], list):
+                logging.error(f"Key '{list_key}' is not a list in YAML file '{yaml_path}'.")
+                raise KeyError
+            matched_item = None
+            for item in current[list_key]:
+                if isinstance(item, dict) and item.get(field) == value:
+                    matched_item = item
+                    break
+            if not matched_item:
+                logging.error(f"No item found in list '{list_key}' with condition '{field}={value}' in YAML file '{yaml_path}'.")
+                raise KeyError
+            current = matched_item
+        else:
+            if key not in current:
+                current[key] = {}
+            current = current[key]
+    return current, keys[-1]
+
 def update_yaml_files(clone_path, update_yaml_entries, submodule_commits):
-    """Update specified YAML files with new submodule commit hashes."""
+    """Update specified YAML files with new values, literal values, or remove keys.
+
+    Each entry can be one of:
+    - submodule_referenced: set key to the commit hash from submodule_commits
+    - value: set key to a literal value (already substituted by collect_yaml_updates)
+    - action: remove: delete the key from the YAML file
+    """
     yaml_obj = YAML()
     yaml_obj.preserve_quotes = True  # Preserve existing quotes
 
     for edit in update_yaml_entries:
         filename = edit['filename']
         key_to_update = edit['key_to_update']
-        submodule_referenced = edit['submodule_referenced']
+        action = edit.get('action')
 
-        # Determine the new commit hash
-        new_commit = submodule_commits.get(submodule_referenced)
-        if not new_commit:
-            logging.error(f"No commit hash found for submodule '{submodule_referenced}'. Cannot update YAML file '{filename}'.")
+        # Determine the new value based on entry type
+        if action == 'remove':
+            new_value = None  # sentinel for removal
+        elif 'value' in edit:
+            new_value = edit['value']
+        elif 'submodule_referenced' in edit:
+            submodule_referenced = edit['submodule_referenced']
+            new_value = submodule_commits.get(submodule_referenced)
+            if not new_value:
+                logging.error(f"No commit hash found for submodule '{submodule_referenced}'. Cannot update YAML file '{filename}'.")
+                continue
+        else:
+            logging.error(f"update_yaml entry for '{filename}' has no value source. Skipping.")
             continue
 
         # Construct full path to the YAML file
@@ -1451,7 +1590,10 @@ def update_yaml_files(clone_path, update_yaml_entries, submodule_commits):
             logging.error(f"YAML file '{yaml_path}' does not exist.")
             continue
 
-        logging.info(f"Updating YAML file '{yaml_path}' at key '{key_to_update}' with commit '{new_commit}'.")
+        if action == 'remove':
+            logging.info(f"Removing key '{key_to_update}' from YAML file '{yaml_path}'.")
+        else:
+            logging.info(f"Updating YAML file '{yaml_path}' at key '{key_to_update}' with value '{new_value}'.")
 
         # Load the YAML file
         try:
@@ -1461,51 +1603,33 @@ def update_yaml_files(clone_path, update_yaml_entries, submodule_commits):
             logging.error(f"Failed to load YAML file '{yaml_path}': {e}")
             continue
 
-        # Traverse the key path with conditional matching
-        keys = key_to_update.split('.')
-        current = data
+        # Traverse the key path
         try:
-            for key in keys[:-1]:
-                if '[' in key and ']' in key:
-                    # Parse condition, e.g., includes.[project=C]
-                    list_key, condition = key.split('[', 1)
-                    condition = condition.rstrip(']')
-                    field, value = condition.split('=', 1)
-                    if list_key not in current or not isinstance(current[list_key], list):
-                        logging.error(f"Key '{list_key}' is not a list in YAML file '{yaml_path}'.")
-                        raise KeyError
-                    # Find the first item in the list where item[field] == value
-                    matched_item = None
-                    for item in current[list_key]:
-                        if isinstance(item, dict) and item.get(field) == value:
-                            matched_item = item
-                            break
-                    if not matched_item:
-                        logging.error(f"No item found in list '{list_key}' with condition '{field}={value}' in YAML file '{yaml_path}'.")
-                        raise KeyError
-                    current = matched_item
-                else:
-                    if key not in current:
-                        current[key] = {}
-                    current = current[key]
-            last_key = keys[-1]
+            current, last_key = _traverse_yaml_key_path(data, key_to_update, yaml_path)
         except KeyError:
             logging.error(f"Key path '{key_to_update}' does not exist in YAML file '{yaml_path}'.")
             continue
 
-        # Update the key with the new commit hash
-        old_value = current.get(last_key, None)
-        current[last_key] = new_commit
-        logging.debug(f"Updated '{key_to_update}' from '{old_value}' to '{new_commit}'.")
+        if action == 'remove':
+            if last_key in current:
+                old_value = current[last_key]
+                del current[last_key]
+                logging.debug(f"Removed '{key_to_update}' (was '{old_value}').")
+            else:
+                logging.debug(f"Key '{last_key}' not found in '{key_to_update}', nothing to remove.")
+                continue
+        else:
+            old_value = current.get(last_key, None)
+            current[last_key] = new_value
+            logging.debug(f"Updated '{key_to_update}' from '{old_value}' to '{new_value}'.")
 
-        # Save the YAML file (always save in Phase 1)
+        # Save the YAML file
         try:
             with open(yaml_path, 'w') as f:
                 yaml_obj.dump(data, f)
             logging.debug(f"Saved updated YAML file '{yaml_path}'.")
         except Exception as e:
             logging.error(f"Failed to save updated YAML file '{yaml_path}': {e}")
-            continue
 
 def run_cleanup(config, tag=None, dry_run=False):
     """Clean up branches, tags, and MRs from a previous failed run."""
@@ -1869,6 +1993,10 @@ def main():
                                         key = edit['key_to_update']
                                         project = key.split('project=')[1].split(']')[0] if 'project=' in key else 'unknown'
                                         logging.info(f"      - Auto-detected CI include: {project} in {filename}")
+                                    elif edit.get('action') == 'remove':
+                                        logging.info(f"      - Remove YAML key: {filename} ({edit['key_to_update']})")
+                                    elif 'value' in edit:
+                                        logging.info(f"      - Set YAML key: {filename} ({edit['key_to_update']} = '{edit['value']}')")
                                     else:
                                         logging.info(f"      - Modified YAML: {filename} ({edit['key_to_update']})")
 

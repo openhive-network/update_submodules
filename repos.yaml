@@ -28,26 +28,65 @@ git@gitlab.syncad.com:hive/haf_api_node.git:
 git@gitlab.syncad.com:hive/reputation_tracker.git:
   ref: 'develop'
   automerge: true
+  update_yaml:
+    - filename: '.gitlab-ci.yml'
+      key_to_update: 'find_haf_image.variables.UPSTREAM_OVERRIDE_TAG'
+      value: '$TAG'
+      when: 'tag'
 
 git@gitlab.syncad.com:hive/balance_tracker.git:
   ref: 'develop'
   automerge: true
+  update_yaml:
+    - filename: '.gitlab-ci.yml'
+      key_to_update: 'find_haf_image.variables.UPSTREAM_OVERRIDE_TAG'
+      value: '$TAG'
+      when: 'tag'
 
 git@gitlab.syncad.com:hive/HAfAH.git:
   ref: 'develop'
   automerge: true
+  update_yaml:
+    - filename: '.gitlab-ci.yml'
+      key_to_update: 'find_haf_image.variables.UPSTREAM_OVERRIDE_TAG'
+      value: '$TAG'
+      when: 'tag'
 
 git@gitlab.syncad.com:hive/hivemind.git:
   ref: 'develop'
   automerge: true
+  update_yaml:
+    # For tagged builds: clean up stale HAF branch overrides and pin to the tag
+    - filename: '.gitlab-ci.yml'
+      key_to_update: 'find_haf_image.variables.UPSTREAM_BRANCH'
+      action: 'remove'
+      when: 'tag'
+    - filename: '.gitlab-ci.yml'
+      key_to_update: 'find_haf_image.variables.HAF_PATTERNS_REF'
+      action: 'remove'
+      when: 'tag'
+    - filename: '.gitlab-ci.yml'
+      key_to_update: 'find_haf_image.variables.UPSTREAM_OVERRIDE_TAG'
+      value: '$TAG'
+      when: 'tag'
 
 git@gitlab.syncad.com:hive/haf_block_explorer.git:
   ref: 'develop'
   automerge: true
+  update_yaml:
+    - filename: '.gitlab-ci.yml'
+      key_to_update: 'find_haf_image.variables.UPSTREAM_OVERRIDE_TAG'
+      value: '$TAG'
+      when: 'tag'
 
 git@gitlab.syncad.com:hive/hivesense.git:
   ref: 'develop'
   automerge: true
+  update_yaml:
+    - filename: '.gitlab-ci.yml'
+      key_to_update: 'find_haf_image.variables.UPSTREAM_OVERRIDE_TAG'
+      value: '$TAG'
+      when: 'tag'
 
 git@gitlab.syncad.com:hive/nft_tracker.git:
   ref: 'develop'
