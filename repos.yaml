@@ -31,7 +31,8 @@ git@gitlab.syncad.com:hive/reputation_tracker.git:
   update_yaml:
     - filename: '.gitlab-ci.yml'
       key_to_update: 'find_haf_image.variables.UPSTREAM_OVERRIDE_TAG'
-      value: '$TAG'
+      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
+      short_sha: true
       when: 'tag'
 
 git@gitlab.syncad.com:hive/balance_tracker.git:
@@ -40,7 +41,8 @@ git@gitlab.syncad.com:hive/balance_tracker.git:
   update_yaml:
     - filename: '.gitlab-ci.yml'
       key_to_update: 'find_haf_image.variables.UPSTREAM_OVERRIDE_TAG'
-      value: '$TAG'
+      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
+      short_sha: true
       when: 'tag'
 
 git@gitlab.syncad.com:hive/HAfAH.git:
@@ -49,14 +51,15 @@ git@gitlab.syncad.com:hive/HAfAH.git:
   update_yaml:
     - filename: '.gitlab-ci.yml'
       key_to_update: 'find_haf_image.variables.UPSTREAM_OVERRIDE_TAG'
-      value: '$TAG'
+      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
+      short_sha: true
       when: 'tag'
 
 git@gitlab.syncad.com:hive/hivemind.git:
   ref: 'develop'
   automerge: true
   update_yaml:
-    # For tagged builds: clean up stale HAF branch overrides and pin to the tag
+    # For tagged builds: clean up stale HAF branch overrides and pin to HAF's commit
     - filename: '.gitlab-ci.yml'
       key_to_update: 'find_haf_image.variables.UPSTREAM_BRANCH'
       action: 'remove'
@@ -67,7 +70,8 @@ git@gitlab.syncad.com:hive/hivemind.git:
       when: 'tag'
     - filename: '.gitlab-ci.yml'
       key_to_update: 'find_haf_image.variables.UPSTREAM_OVERRIDE_TAG'
-      value: '$TAG'
+      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
+      short_sha: true
       when: 'tag'
 
 git@gitlab.syncad.com:hive/haf_block_explorer.git:
@@ -76,7 +80,8 @@ git@gitlab.syncad.com:hive/haf_block_explorer.git:
   update_yaml:
     - filename: '.gitlab-ci.yml'
       key_to_update: 'find_haf_image.variables.UPSTREAM_OVERRIDE_TAG'
-      value: '$TAG'
+      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
+      short_sha: true
       when: 'tag'
 
 git@gitlab.syncad.com:hive/hivesense.git:
@@ -85,7 +90,8 @@ git@gitlab.syncad.com:hive/hivesense.git:
   update_yaml:
     - filename: '.gitlab-ci.yml'
       key_to_update: 'find_haf_image.variables.UPSTREAM_OVERRIDE_TAG'
-      value: '$TAG'
+      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
+      short_sha: true
       when: 'tag'
 
 git@gitlab.syncad.com:hive/nft_tracker.git:

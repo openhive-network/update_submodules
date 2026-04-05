@@ -229,6 +229,9 @@ def validate_config(config):
                 if 'when' in edit and edit['when'] != 'tag':
                     logging.error(f"Invalid 'when' value '{edit['when']}' in 'update_yaml' for repository '{repo_url}'. Only 'tag' is supported.")
                     sys.exit(1)
+                if 'short_sha' in edit and not isinstance(edit['short_sha'], bool):
+                    logging.error(f"'short_sha' must be a boolean in 'update_yaml' for repository '{repo_url}'.")
+                    sys.exit(1)
     logging.info("Configuration validation passed.")
 
 def resolve_submodule_url(parent_repo_url, submodule_url):
@@ -937,7 +940,7 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
 
     # Collect manual YAML file updates (from config) — includes standalone entries
     # that don't depend on submodule changes (e.g., value or action: remove entries)
-    manual_yaml_updates = collect_yaml_updates(settings, updated_submodules, tag_name=tag)
+    manual_yaml_updates = collect_yaml_updates(settings, updated_submodules, tag_name=tag, all_repo_commits=updated_repos_commits)
 
     # Determine if we have any updates to make
     has_submodule_updates = bool(updated_submodules)
@@ -1310,16 +1313,21 @@ def push_branch(repo, repo_url, branch_name, settings, automerge, create_mr, dry
         logging.error(f"Failed to push branch '{branch_name}' to '{repo_url}': {e}")
         sys.exit(1)
 
-def collect_yaml_updates(current_repo_settings, updated_submodules, tag_name=None):
+def collect_yaml_updates(current_repo_settings, updated_submodules, tag_name=None, all_repo_commits=None):
     """Collect YAML file updates based on submodule updates and standalone entries.
 
-    Handles three types of entries:
-    - submodule_referenced: triggered when the referenced submodule was updated
+    Handles four types of entries:
+    - submodule_referenced: set key to the commit hash of the referenced repo.
+      Matches against both local submodule updates and all tracked repo commits
+      (so it works even when the referenced repo isn't a submodule).
+      Use 'short_sha: true' to truncate the commit to 8 characters.
     - value: standalone entry with a literal value ($TAG is substituted with tag_name)
     - action: remove: standalone entry that removes a YAML key
 
     Entries with 'when: tag' are skipped if tag_name is None.
     """
+    if all_repo_commits is None:
+        all_repo_commits = {}
     updated_yaml_files = {}
     update_yaml_entries = current_repo_settings.get('update_yaml', [])
     for edit in update_yaml_entries:
@@ -1344,11 +1352,14 @@ def collect_yaml_updates(current_repo_settings, updated_submodules, tag_name=Non
                 value = value.replace('$TAG', tag_name)
             entry['value'] = value
         elif 'submodule_referenced' in edit:
-            # Submodule-dependent entry — only include if submodule was updated
+            # Repo-dependent entry — include if the referenced repo is tracked
+            # (as a submodule or as any repo in the config that has been processed)
             submodule_referenced_url = edit['submodule_referenced']
-            if submodule_referenced_url not in updated_submodules:
+            if submodule_referenced_url not in updated_submodules and submodule_referenced_url not in all_repo_commits:
                 continue
             entry['submodule_referenced'] = submodule_referenced_url
+            if edit.get('short_sha'):
+                entry['short_sha'] = True
         else:
             continue
 
@@ -1578,8 +1589,10 @@ def update_yaml_files(clone_path, update_yaml_entries, submodule_commits):
             submodule_referenced = edit['submodule_referenced']
             new_value = submodule_commits.get(submodule_referenced)
             if not new_value:
-                logging.error(f"No commit hash found for submodule '{submodule_referenced}'. Cannot update YAML file '{filename}'.")
+                logging.error(f"No commit hash found for '{submodule_referenced}'. Cannot update YAML file '{filename}'.")
                 continue
+            if edit.get('short_sha'):
+                new_value = new_value[:8]
         else:
             logging.error(f"update_yaml entry for '{filename}' has no value source. Skipping.")
             continue
