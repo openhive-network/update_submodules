@@ -723,14 +723,10 @@ def validate_yaml_operations(config):
                             if key not in current:
                                 if is_remove:
                                     warnings.append(f"Key '{key}' not found for removal in path '{key_to_update}' in '{edit['filename']}' in '{repo_url}' (will be skipped)")
-                                    raise KeyError
-                                elif is_value:
-                                    # Will be created during update
-                                    warnings.append(f"Key '{key}' not found in path '{key_to_update}' in YAML file '{edit['filename']}' in repository '{repo_url}' (will be created)")
-                                    raise KeyError
                                 else:
-                                    errors.append(f"Key '{key}' not found in path '{key_to_update}' in YAML file '{edit['filename']}' in repository '{repo_url}'")
-                                    raise KeyError
+                                    # Intermediate keys will be created during update
+                                    warnings.append(f"Key '{key}' not found in path '{key_to_update}' in YAML file '{edit['filename']}' in repository '{repo_url}' (will be created)")
+                                raise KeyError
                             current = current[key]
 
                     # Check last key exists
