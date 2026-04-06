@@ -566,8 +566,9 @@ def get_submodule_desired_commit(submodule_repo, desired_ref, submodule_url=None
                 submodule_repo.create_remote(local_remote_name, local_path)
                 logging.debug(f"Added local remote '{local_remote_name}' pointing to '{local_path}'")
 
-            # Fetch from local remote
-            submodule_repo.remotes[local_remote_name].fetch()
+            # Fetch from local remote (--no-tags avoids exit code 1 when
+            # a local tag conflicts with a tag in the source repo)
+            submodule_repo.remotes[local_remote_name].fetch(no_tags=True)
             local_remote_used = True
             logging.debug(f"Fetched from local remote for submodule '{get_repo_name(submodule_url)}'")
 
