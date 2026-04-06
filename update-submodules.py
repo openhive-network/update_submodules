@@ -360,6 +360,14 @@ def build_dependency_graph(config):
         graph[repo_url].extend(filtered_submodules)
         logging.debug(f"Repository '{repo_url}' has submodules: {filtered_submodules}")
 
+        # Also add dependencies from update_yaml submodule_referenced entries
+        settings = config.get(repo_url, {})
+        for edit in settings.get('update_yaml', []):
+            ref_url = edit.get('submodule_referenced')
+            if ref_url and ref_url in repo_urls and ref_url not in graph[repo_url]:
+                graph[repo_url].append(ref_url)
+                logging.debug(f"Repository '{repo_url}' depends on '{get_repo_name(ref_url)}' via update_yaml")
+
     return graph
 
 def topological_sort(graph):
