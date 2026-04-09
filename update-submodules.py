@@ -657,7 +657,11 @@ def is_branch(ref, repo):
 
 def is_remote_branch(ref, repo):
     """Check if the reference exists as a remote branch."""
-    return any(r.name.split('/')[-1] == ref for r in repo.remotes.origin.refs)
+    prefix = 'origin/'
+    return any(
+        r.name.startswith(prefix) and r.name[len(prefix):] == ref
+        for r in repo.remotes.origin.refs
+    )
 
 def validate_yaml_operations(config):
     """Pre-validate all YAML file operations to ensure they will succeed."""
