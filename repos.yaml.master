@@ -1,46 +1,129 @@
+# Configuration for the --release-to-master workflow.
+#
+# Each entry's `ref` is the master/main branch the release will land on.
+# The script rebases `source_ref` (default 'develop') onto that target,
+# auto-resolving submodule and YAML conflicts in favor of the source branch.
+#
+# `source_ref:` can be set to a specific develop commit (or any ref) when you
+# want to release a snapshot rather than current develop tip — for example
+# when develop has landed work that should not ship in this release.
+#
+# To run: `update-submodules.py --release-to-master --tag <version>`
+# (this file is auto-selected when --release-to-master is passed).
+
+# Base CI configuration - must be processed first as other repos depend on it
+git@gitlab.syncad.com:hive/common-ci-configuration.git:
+  ref: 'main'
+  automerge: true
+
+# Core repos
+git@gitlab.syncad.com:hive/hive.git:
+  ref: 'master'
+  # source_ref: '<develop-sha>'   # uncomment to release a specific develop commit
+  automerge: true
+
 git@gitlab.syncad.com:hive/haf.git:
   ref: 'master'
   # or
   # ref_from_dir: /path/to/local/checkout/of/haf
   automerge: true
-git@gitlab.syncad.com:hive/hive.git:
-  ref: 'master'
-  automerge: true
+  # Manual entry needed: this is a local YAML include, not the main CI file
+  update_yaml:
+    - filename: 'scripts/ci-helpers/prepare_data_image_job.yml'
+      key_to_update: 'include[project=hive/common-ci-configuration].ref'
+      submodule_referenced: 'git@gitlab.syncad.com:hive/common-ci-configuration.git'
+
 git@gitlab.syncad.com:hive/haf_api_node.git:
   ref: 'master'
   automerge: true
+
+# HAF applications
+# CI includes between these and haf are auto-detected from .gitlab-ci.yml.
+# The `when: 'tag'` rules below replace the develop-time UPSTREAM_BRANCH
+# variable with the tag name so the tagged builds pin against the released HAF.
 git@gitlab.syncad.com:hive/reputation_tracker.git:
   ref: 'main'
   automerge: true
   update_yaml:
     - filename: '.gitlab-ci.yml'
-      key_to_update: 'include[project=hive/haf].ref'
-      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
+      key_to_update: 'find_haf_image.variables.UPSTREAM_BRANCH'
+      value: '$TAG'
+      when: 'tag'
+
 git@gitlab.syncad.com:hive/balance_tracker.git:
   ref: 'master'
   automerge: true
   update_yaml:
     - filename: '.gitlab-ci.yml'
-      key_to_update: 'include[project=hive/haf].ref'
-      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
+      key_to_update: 'find_haf_image.variables.UPSTREAM_BRANCH'
+      value: '$TAG'
+      when: 'tag'
+
 git@gitlab.syncad.com:hive/HAfAH.git:
   ref: 'master'
   automerge: true
   update_yaml:
     - filename: '.gitlab-ci.yml'
-      key_to_update: 'include[project=hive/haf].ref'
-      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
+      key_to_update: 'find_haf_image.variables.UPSTREAM_BRANCH'
+      value: '$TAG'
+      when: 'tag'
+
 git@gitlab.syncad.com:hive/hivemind.git:
   ref: 'master'
   automerge: true
   update_yaml:
-    - filename: '.gitlab-ci.yaml'
-      key_to_update: 'include[project=hive/haf].ref'
-      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
+    # For tagged builds: clean up stale HAF branch overrides and set UPSTREAM_BRANCH to tag
+    - filename: '.gitlab-ci.yml'
+      key_to_update: 'find_haf_image.variables.HAF_PATTERNS_REF'
+      action: 'remove'
+      when: 'tag'
+    - filename: '.gitlab-ci.yml'
+      key_to_update: 'find_haf_image.variables.UPSTREAM_BRANCH'
+      value: '$TAG'
+      when: 'tag'
+
 git@gitlab.syncad.com:hive/haf_block_explorer.git:
   ref: 'master'
   automerge: true
   update_yaml:
     - filename: '.gitlab-ci.yml'
-      key_to_update: 'include[project=hive/haf].ref'
+      key_to_update: 'find_haf_image.variables.UPSTREAM_BRANCH'
+      value: '$TAG'
+      when: 'tag'
+
+git@gitlab.syncad.com:hive/hivesense.git:
+  ref: 'main'
+  automerge: true
+  update_yaml:
+    - filename: '.gitlab-ci.yml'
+      key_to_update: 'find_haf_image.variables.UPSTREAM_BRANCH'
+      value: '$TAG'
+      when: 'tag'
+
+git@gitlab.syncad.com:hive/nft_tracker.git:
+  ref: 'master'
+  automerge: true
+
+# User interfaces
+# block_explorer_ui is intentionally NOT listed here for the 1.28.6 release.
+# Its develop branch contains an auth-system overhaul (Issue #672) and other
+# new features that are not appropriate for this patch release; we want the
+# 1.28.6 tag in BE-UI to sit on the same commit as 1.28.6-rc14 instead of
+# whatever a develop->master rebase would produce. After the rest of the
+# master release lands, tag rc14's commit in block_explorer_ui manually:
+#     git -C block_explorer_ui tag 1.28.6 1.28.6-rc14^{commit}
+#     git -C block_explorer_ui push origin 1.28.6
+# (BE-UI's master branch will lag — that's a separate decision for the team.)
+
+git@gitlab.syncad.com:hive/denser.git:
+  ref: 'main'
+  automerge: true
+  update_yaml:
+    - filename: '.gitlab-ci.yml'
+      key_to_update: 'variables.HAF_COMMIT'
       submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
+
+# Tools
+git@gitlab.syncad.com:hive/drone.git:
+  ref: 'master'
+  automerge: true
