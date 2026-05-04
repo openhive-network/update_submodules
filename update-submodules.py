@@ -487,21 +487,15 @@ def perform_release_rebase(repo_path: str, rebase_base: str, source_branch: str,
                             pass
                         elif 'You must edit all merge conflicts' in result.stderr or 'fix conflicts' in result.stderr.lower():
                             # There are still unresolved conflicts, but we didn't detect them
-                            # This might be a different type of conflict marker
-                            logging.warning(f"Unhandled conflict detected at iteration {iteration}")
-                            logging.warning(f"stderr: {result.stderr[:500]}")
-                            # Check if we're stuck in a loop
-                            if iteration > 50:
-                                logging.error("Possible infinite loop detected - same conflict not resolving")
-                                return False, conflicts_resolved
+                            # via status; the next iteration's status check should see them.
+                            # The stuck-state check at the top of the loop catches genuine
+                            # infinite loops (same status for 10+ iterations).
+                            logging.debug(f"Unhandled conflict at iteration {iteration}; will retry: {result.stderr[:300]}")
                         else:
-                            # Some other error
-                            logging.debug(f"Rebase continue failed: {result.stderr[:200]}")
-                            # Don't loop infinitely on unknown errors
-                            if iteration > 50 and result.returncode != 0:
-                                logging.error(f"Repeated rebase errors - aborting after {iteration} iterations")
-                                logging.error(f"Last error: {result.stderr}")
-                                return False, conflicts_resolved
+                            # Some other error — log and let the next iteration try to
+                            # resolve via the conflict resolver.  Real infinite loops are
+                            # caught by the same-state check, not by an iteration count.
+                            logging.debug(f"Rebase continue failed at iteration {iteration}: {result.stderr[:300]}")
                 else:
                     break
             else:
@@ -518,20 +512,9 @@ def perform_release_rebase(repo_path: str, rebase_base: str, source_branch: str,
                         # Files cleared; loop will retry --continue
                         pass
                     elif 'You must edit all merge conflicts' in result.stderr or 'fix conflicts' in result.stderr.lower():
-                        # We resolved conflicts but git says there are still conflicts
-                        logging.warning(f"Conflicts remain after resolution attempt at iteration {iteration}")
-                        logging.warning(f"stderr: {result.stderr[:500]}")
-                        # Check for infinite loop
-                        if iteration > 50:
-                            logging.error("Stuck in conflict resolution loop")
-                            return False, conflicts_resolved
+                        logging.debug(f"Conflicts remain after resolution at iteration {iteration}; will retry: {result.stderr[:300]}")
                     else:
-                        logging.debug(f"Rebase continue failed after conflict resolution: {result.stderr[:200]}")
-                        # Don't loop infinitely
-                        if iteration > 50:
-                            logging.error(f"Repeated errors after conflict resolution - aborting")
-                            logging.error(f"Last error: {result.stderr}")
-                            return False, conflicts_resolved
+                        logging.debug(f"Rebase continue failed after resolution at iteration {iteration}: {result.stderr[:300]}")
                     # Otherwise, we'll loop again to handle next conflict
 
         if iteration >= max_iterations:
