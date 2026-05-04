@@ -87,9 +87,15 @@ git@gitlab.syncad.com:hive/nft_tracker.git:
   automerge: true
 
 # User interfaces
+# block_explorer_ui pinned to the 1.28.6-rc14 commit for the 1.28.6 release:
+# develop carries an auth-system overhaul (Issue #672) plus other features that
+# are not appropriate for this patch release.  The pin makes the script tag
+# 1.28.6 directly on the rc14 commit (no commit, no MR — BE-UI has no
+# update_yaml rules and isn't referenced as a submodule by any other repo).
 git@gitlab.syncad.com:hive/block_explorer_ui.git:
-  ref: 'develop'
-  automerge: true
+  ref: '10fcf8ee1b33fa5307c5819eea60de8d76ce49e8'
+  create_merge_request: false
+  automerge: false
 
 git@gitlab.syncad.com:hive/denser.git:
   ref: 'develop'
