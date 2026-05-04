@@ -433,6 +433,42 @@ def perform_release_rebase(repo_path: str, rebase_base: str, source_branch: str,
                 conflicts_resolved.append(f"deleted:{file_path}")
                 conflicts_found = True
 
+            def _remove_untracked_blockers(stderr_text: str) -> int:
+                """Parse git's 'untracked working tree files would be overwritten' error,
+                remove the listed files from the working tree, return count removed.
+
+                Untracked blockers are usually leftover from earlier --skip calls where
+                the commit's content was already in the tree (so git reported "nothing
+                to commit" and we skipped) but the working-tree files the commit was
+                supposed to add stayed on disk as untracked.  Removing them lets the
+                next commit that wants to write the same paths proceed."""
+                if 'untracked working tree files would be overwritten' not in stderr_text:
+                    return 0
+                files, in_list = [], False
+                for line in stderr_text.split('\n'):
+                    if 'following untracked working tree files would be overwritten' in line:
+                        in_list = True
+                        continue
+                    if in_list:
+                        # Indented file lines belong to the list; non-indented prose ends it.
+                        if line and not line.startswith((' ', '\t')):
+                            break
+                        stripped = line.strip()
+                        if stripped:
+                            files.append(stripped)
+                removed = 0
+                for f in files:
+                    try:
+                        if os.path.isfile(f) or os.path.islink(f):
+                            os.unlink(f); removed += 1
+                        elif os.path.isdir(f):
+                            shutil.rmtree(f, ignore_errors=True); removed += 1
+                    except OSError as e:
+                        logging.warning(f"Could not remove blocker '{f}': {e}")
+                if removed:
+                    logging.info(f"Removed {removed} untracked file(s) blocking rebase: {files}")
+                return removed
+
             if not conflicts_found:
                 # No conflicts found, but rebase might still be in progress
                 # Check if we need to continue
@@ -446,6 +482,9 @@ def perform_release_rebase(repo_path: str, rebase_base: str, source_branch: str,
                             logging.debug("Skipping empty commit")
                             subprocess.run(['git', '-c', 'core.editor=true', 'rebase', '--skip'],
                                          check=True, env=env)
+                        elif _remove_untracked_blockers(result.stderr):
+                            # Files cleared; loop will retry --continue
+                            pass
                         elif 'You must edit all merge conflicts' in result.stderr or 'fix conflicts' in result.stderr.lower():
                             # There are still unresolved conflicts, but we didn't detect them
                             # This might be a different type of conflict marker
@@ -475,6 +514,9 @@ def perform_release_rebase(repo_path: str, rebase_base: str, source_branch: str,
                         logging.debug("Skipping empty commit after conflict resolution")
                         subprocess.run(['git', '-c', 'core.editor=true', 'rebase', '--skip'],
                                      check=True, env=env)
+                    elif _remove_untracked_blockers(result.stderr):
+                        # Files cleared; loop will retry --continue
+                        pass
                     elif 'You must edit all merge conflicts' in result.stderr or 'fix conflicts' in result.stderr.lower():
                         # We resolved conflicts but git says there are still conflicts
                         logging.warning(f"Conflicts remain after resolution attempt at iteration {iteration}")
