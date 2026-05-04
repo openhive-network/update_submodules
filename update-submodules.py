@@ -10,6 +10,7 @@ import logging
 import requests
 import configparser
 import subprocess
+import shutil
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple
 from collections import defaultdict
@@ -275,7 +276,9 @@ def perform_release_rebase(repo_path: str, rebase_base: str, source_branch: str,
     Args:
         repo_path: Path to the repository
         rebase_base: Commit to use as the starting point for rebase
-        source_branch: Not used anymore (kept for compatibility)
+        source_branch: The source ref (e.g. 'origin/develop') used to resolve
+                       conflicts — every conflicted path is aligned with
+                       source_branch's TIP, which is the desired end state.
         target_branch: Branch to rebase onto (e.g., origin/master)
         commit_count: Number of commits being rebased (for setting iteration limit)
 
@@ -356,98 +359,74 @@ def perform_release_rebase(repo_path: str, rebase_base: str, source_branch: str,
             logging.debug(f"Rebase iteration {iteration}, status lines: {len(status_lines)}")
 
             conflicts_found = False
-            # Conflict status taxonomy (XY where X=ours/upstream/master, Y=theirs/develop):
-            #   UU, AA       — both modified or both added → take theirs (develop wins)
-            #   DU           — we deleted, they updated    → take theirs (re-add from develop)
-            #   UA           — they added (we have nothing) → take theirs
-            #   UD, DD       — they deleted (or both did)  → accept deletion
-            #   AU           — we added (they have nothing) → drop our addition
-            take_theirs_statuses = ('UU', 'AA', 'DU', 'UA')
-            accept_delete_statuses = ('UD', 'DD', 'AU')
+            # Resolution rule for release-to-master: every conflicted path is aligned
+            # with source_branch's TIP (origin/develop) — that's the desired end state
+            # of the rebase, so any intermediate-state conflict is resolved by jumping
+            # straight there.  This handles every unmerged status (UU/AA/DU/UA/UD/DD/AU)
+            # uniformly and doesn't depend on .gitmodules being present in the working
+            # tree (it isn't, when develop has dropped a submodule that master still has).
+            UNMERGED = ('UU', 'AA', 'DU', 'UA', 'UD', 'DD', 'AU')
 
             for status_line in status_lines:
                 if len(status_line) < 4:
                     continue
                 status = status_line[:2]
-                if status not in take_theirs_statuses and status not in accept_delete_statuses:
+                if status not in UNMERGED:
                     continue
                 file_path = status_line[3:].strip()
 
-                # Check if it's a submodule by looking at .gitmodules
-                is_submodule = False
-                try:
-                    gm_result = subprocess.run([
-                        'git', 'config', '--file', '.gitmodules',
-                        '--get-regexp', 'path'
-                    ], capture_output=True, text=True)
-                    if gm_result.returncode == 0:
-                        for gm_line in gm_result.stdout.strip().split('\n'):
-                            parts = gm_line.split()
-                            if len(parts) >= 2 and parts[-1] == file_path:
-                                is_submodule = True
-                                break
-                except Exception:
-                    pass
+                # What does source_branch's tip have at this path?
+                src_lookup = subprocess.run(
+                    ['git', 'ls-tree', source_branch, '--', file_path],
+                    capture_output=True, text=True
+                )
+                src_has_path = bool(src_lookup.returncode == 0 and src_lookup.stdout.strip())
 
-                if status in accept_delete_statuses:
-                    # Develop dropped (or both did) this path — propagate the deletion.
-                    logging.debug(f"Accepting deletion for {file_path} (status {status})")
-                    if is_submodule:
-                        subprocess.run(['git', 'rm', '--cached', '-f', file_path],
-                                       capture_output=True, text=True)
-                    else:
-                        subprocess.run(['git', 'rm', '-f', file_path],
-                                       capture_output=True, text=True)
-                    conflicts_resolved.append(f"deleted:{file_path}")
-                    conflicts_found = True
-                    continue
+                # Always clear the conflicted entry from the index first, then re-stage
+                # at source's version (or leave gone if source doesn't have it).
+                subprocess.run(['git', 'rm', '--cached', '-f', '--', file_path],
+                               capture_output=True, text=True)
 
-                # status in take_theirs_statuses — develop's version wins
-                if is_submodule:
-                    logging.debug(f"Resolving submodule conflict: {file_path} (status {status})")
+                if src_has_path:
+                    parts = src_lookup.stdout.split()
+                    if len(parts) >= 3:
+                        mode = parts[0]      # e.g. '100644', '100755', '120000', '160000'
+                        obj_hash = parts[2]
+                        update_result = subprocess.run(
+                            ['git', 'update-index', '--add', '--cacheinfo', mode, obj_hash, file_path],
+                            capture_output=True, text=True
+                        )
+                        if update_result.returncode != 0:
+                            logging.warning(f"Could not stage {file_path} at source's version: {update_result.stderr.strip()}")
 
-                    # Clear stale index entries for this path then write develop's gitlink.
-                    subprocess.run(['git', 'rm', '--cached', '-f', file_path],
-                                   capture_output=True, text=True)
+                        if mode == '160000':
+                            kind = 'submodule'
+                            logging.debug(f"Resolved submodule {file_path} → {obj_hash[:8]} from source (status {status})")
+                        else:
+                            # Restore working tree from index for regular files / symlinks
+                            subprocess.run(['git', 'checkout-index', '-f', '--', file_path],
+                                           capture_output=True, text=True)
+                            kind = 'yaml' if file_path.endswith(('.yml', '.yaml')) else 'other'
+                            if kind == 'other':
+                                logging.warning(f"Unexpected conflict in {file_path} (status {status}) - restoring source's version")
+                            else:
+                                logging.debug(f"Resolved YAML {file_path} from source (status {status})")
+                        conflicts_resolved.append(f"{kind}:{file_path}")
+                        conflicts_found = True
+                        continue
 
-                    # Get the commit that develop wants for this submodule.
-                    theirs_commit_result = subprocess.run([
-                        'git', 'ls-tree', 'REBASE_HEAD', file_path
-                    ], capture_output=True, text=True)
-
-                    if theirs_commit_result.returncode == 0 and theirs_commit_result.stdout:
-                        # Format: "160000 commit <hash>\t<path>"
-                        parts = theirs_commit_result.stdout.split()
-                        if len(parts) >= 3:
-                            theirs_commit = parts[2]
-                            logging.debug(f"Will use {file_path} at commit {theirs_commit} from develop")
-                            update_result = subprocess.run([
-                                'git', 'update-index', '--add', '--cacheinfo',
-                                '160000', theirs_commit, file_path
-                            ], capture_output=True, text=True)
-                            if update_result.returncode != 0:
-                                logging.warning(f"Could not update index for {file_path}, trying alternative")
-                                subprocess.run(['git', 'add', file_path], capture_output=True)
-                    else:
-                        # Develop has no entry for this path either; treat as deletion.
-                        logging.debug(f"REBASE_HEAD has no entry for {file_path}; leaving deleted")
-
-                    conflicts_resolved.append(f"submodule:{file_path}")
-                    conflicts_found = True
-                elif file_path.endswith(('.yml', '.yaml')):
-                    logging.debug(f"Resolving YAML conflict: {file_path} (status {status})")
-                    subprocess.run(['git', 'checkout', '--theirs', '--', file_path], check=True)
-                    subprocess.run(['git', 'add', file_path], check=True)
-                    conflicts_resolved.append(f"yaml:{file_path}")
-                    conflicts_found = True
-                else:
-                    # Any other file conflict - take theirs for release.  Log so the
-                    # human reviewing the run can spot anything weird.
-                    logging.warning(f"Unexpected conflict in {file_path} (status {status}) - taking version from develop branch")
-                    subprocess.run(['git', 'checkout', '--theirs', '--', file_path], check=True)
-                    subprocess.run(['git', 'add', file_path], check=True)
-                    conflicts_resolved.append(f"other:{file_path}")
-                    conflicts_found = True
+                # Source doesn't have this path → propagate the deletion.
+                logging.debug(f"Path {file_path} absent on source — removing (status {status})")
+                full_path = os.path.join(repo_path, file_path)
+                if os.path.isdir(full_path) and not os.path.islink(full_path):
+                    shutil.rmtree(full_path, ignore_errors=True)
+                elif os.path.lexists(full_path):
+                    try:
+                        os.unlink(full_path)
+                    except OSError:
+                        pass
+                conflicts_resolved.append(f"deleted:{file_path}")
+                conflicts_found = True
 
             if not conflicts_found:
                 # No conflicts found, but rebase might still be in progress
