@@ -1,0 +1,46 @@
+git@gitlab.syncad.com:hive/haf.git:
+  ref: 'develop'
+  # or
+  # ref_from_dir: /path/to/local/checkout/of/haf
+  automerge: true
+git@gitlab.syncad.com:hive/hive.git:
+  ref: 'develop'
+  automerge: true
+git@gitlab.syncad.com:hive/haf_api_node.git:
+  ref: 'develop'
+  automerge: true
+git@gitlab.syncad.com:hive/reputation_tracker.git:
+  ref: 'develop'
+  automerge: true
+  update_yaml:
+    - filename: '.gitlab-ci.yml'
+      key_to_update: 'include[project=hive/haf].ref'
+      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
+git@gitlab.syncad.com:hive/balance_tracker.git:
+  ref: 'develop'
+  automerge: true
+  update_yaml:
+    - filename: '.gitlab-ci.yml'
+      key_to_update: 'include[project=hive/haf].ref'
+      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
+git@gitlab.syncad.com:hive/HAfAH.git:
+  ref: 'develop'
+  automerge: true
+  update_yaml:
+    - filename: '.gitlab-ci.yml'
+      key_to_update: 'include[project=hive/haf].ref'
+      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
+git@gitlab.syncad.com:hive/hivemind.git:
+  ref: 'develop'
+  automerge: true
+  update_yaml:
+    - filename: '.gitlab-ci.yaml'
+      key_to_update: 'include[project=hive/haf].ref'
+      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
+git@gitlab.syncad.com:hive/haf_block_explorer.git:
+  ref: 'develop'
+  automerge: true
+  update_yaml:
+    - filename: '.gitlab-ci.yml'
+      key_to_update: 'include[project=hive/haf].ref'
+      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'

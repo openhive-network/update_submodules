@@ -15,9 +15,9 @@ git@gitlab.syncad.com:hive/haf.git:
   automerge: true
   # Manual entry needed: this is a local YAML include, not the main CI file
   update_yaml:
-    - filename: 'scripts/ci-helpers/prepare_data_image_job.yml'
-      key_to_update: 'include[project=hive/common-ci-configuration].ref'
-      submodule_referenced: 'git@gitlab.syncad.com:hive/common-ci-configuration.git'
+  - filename: 'scripts/ci-helpers/prepare_data_image_job.yml'
+    key_to_update: 'include[project=hive/common-ci-configuration].ref'
+    submodule_referenced: 'git@gitlab.syncad.com:hive/common-ci-configuration.git'
 
 git@gitlab.syncad.com:hive/haf_api_node.git:
   ref: 'develop'
@@ -29,71 +29,59 @@ git@gitlab.syncad.com:hive/reputation_tracker.git:
   ref: 'develop'
   automerge: true
   update_yaml:
-    - filename: '.gitlab-ci.yml'
-      key_to_update: 'find_haf_image.variables.UPSTREAM_OVERRIDE_TAG'
-      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
-      short_sha: true
-      when: 'tag'
-
+  - filename: .gitlab-ci.yml
+    key_to_update: find_haf_image.variables.UPSTREAM_BRANCH
+    value: $TAG
+    when: tag
 git@gitlab.syncad.com:hive/balance_tracker.git:
   ref: 'develop'
   automerge: true
   update_yaml:
-    - filename: '.gitlab-ci.yml'
-      key_to_update: 'find_haf_image.variables.UPSTREAM_OVERRIDE_TAG'
-      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
-      short_sha: true
-      when: 'tag'
-
+  - filename: .gitlab-ci.yml
+    key_to_update: find_haf_image.variables.UPSTREAM_BRANCH
+    value: $TAG
+    when: tag
 git@gitlab.syncad.com:hive/HAfAH.git:
   ref: 'develop'
   automerge: true
   update_yaml:
-    - filename: '.gitlab-ci.yml'
-      key_to_update: 'find_haf_image.variables.UPSTREAM_OVERRIDE_TAG'
-      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
-      short_sha: true
-      when: 'tag'
-
+  - filename: .gitlab-ci.yml
+    key_to_update: find_haf_image.variables.UPSTREAM_BRANCH
+    value: $TAG
+    when: tag
 git@gitlab.syncad.com:hive/hivemind.git:
   ref: 'develop'
   automerge: true
   update_yaml:
     # For tagged builds: clean up stale HAF branch overrides and pin to HAF's commit
-    - filename: '.gitlab-ci.yml'
-      key_to_update: 'find_haf_image.variables.UPSTREAM_BRANCH'
-      action: 'remove'
-      when: 'tag'
-    - filename: '.gitlab-ci.yml'
-      key_to_update: 'find_haf_image.variables.HAF_PATTERNS_REF'
-      action: 'remove'
-      when: 'tag'
-    - filename: '.gitlab-ci.yml'
-      key_to_update: 'find_haf_image.variables.UPSTREAM_OVERRIDE_TAG'
-      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
-      short_sha: true
-      when: 'tag'
-
+  - filename: .gitlab-ci.yml
+    key_to_update: find_haf_image.variables.UPSTREAM_BRANCH
+    action: remove
+    when: tag
+  - filename: .gitlab-ci.yml
+    key_to_update: find_haf_image.variables.HAF_PATTERNS_REF
+    action: remove
+    when: tag
+  - filename: .gitlab-ci.yml
+    key_to_update: find_haf_image.variables.UPSTREAM_BRANCH
+    value: $TAG
+    when: tag
 git@gitlab.syncad.com:hive/haf_block_explorer.git:
   ref: 'develop'
   automerge: true
   update_yaml:
-    - filename: '.gitlab-ci.yml'
-      key_to_update: 'find_haf_image.variables.UPSTREAM_OVERRIDE_TAG'
-      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
-      short_sha: true
-      when: 'tag'
-
+  - filename: .gitlab-ci.yml
+    key_to_update: find_haf_image.variables.UPSTREAM_BRANCH
+    value: $TAG
+    when: tag
 git@gitlab.syncad.com:hive/hivesense.git:
   ref: 'develop'
   automerge: true
   update_yaml:
-    - filename: '.gitlab-ci.yml'
-      key_to_update: 'find_haf_image.variables.UPSTREAM_OVERRIDE_TAG'
-      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
-      short_sha: true
-      when: 'tag'
-
+  - filename: .gitlab-ci.yml
+    key_to_update: find_haf_image.variables.UPSTREAM_BRANCH
+    value: $TAG
+    when: tag
 git@gitlab.syncad.com:hive/nft_tracker.git:
   ref: 'develop'
   automerge: true
@@ -107,9 +95,9 @@ git@gitlab.syncad.com:hive/denser.git:
   ref: 'develop'
   automerge: true
   update_yaml:
-    - filename: '.gitlab-ci.yml'
-      key_to_update: 'variables.HAF_COMMIT'
-      submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
+  - filename: '.gitlab-ci.yml'
+    key_to_update: 'variables.HAF_COMMIT'
+    submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
 
 # Test utilities (submodules used by multiple repos)
 git@gitlab.syncad.com:hive/tests_api.git:
@@ -127,4 +115,12 @@ git@gitlab.syncad.com:hive/wax.git:
 
 git@gitlab.syncad.com:hive/beekeeper.git:
   ref: 'master'
+  automerge: true
+
+git@gitlab.syncad.com:hive/hafsql.git:
+  ref: 'main'
+  automerge: true
+
+git@gitlab.syncad.com:hive/proxy-whitelist.git:
+  ref: 'main'
   automerge: true
