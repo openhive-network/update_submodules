@@ -169,112 +169,96 @@ def delete_gitlab_tag_via_api(repo_url, tag):
 # ============================================================================
 
 def find_rebase_base(repo_path: str, source_ref: str = 'develop',
-                     target_branch: str = 'origin/master', max_commits: int = 500) -> Optional[str]:
+                     target_branch: str = 'origin/master',
+                     max_target_walk: int = 200) -> Optional[str]:
     """
-    Find the commit on source_ref that corresponds to a commit on target_branch.
+    Find the commit on source_ref whose git tree matches target_branch's HEAD.
 
-    Walks backwards from HEAD of both branches looking for matching commits by patch-id.
-    This handles rebased commits and doesn't assume any specific commit patterns.
+    Releases historically bring master/main to the same tree state as some commit
+    on develop, but with a different SHA (because of how releases land — typically
+    via a feature branch and MR rather than a merge).  Past hotfixes that landed on
+    master without being mirrored onto develop can also accumulate, but their tree
+    effect is usually re-introduced in develop's own history.  In both cases the
+    correspondence we want is "same tree", not "same patch" — patch-id is sensitive
+    to whitespace and rebase noise, tree-hash isn't.
 
-    Args:
-        repo_path: Path to the repository
-        source_ref: Reference to rebase from (branch, tag, or commit)
-        target_branch: Branch to rebase onto
-        max_commits: Maximum number of commits to check on each branch
+    Algorithm:
+      1. Walk source_ref from HEAD backwards, building a {tree_hash: commit} map
+         (most recent occurrence per tree wins, since git log is reverse-chrono).
+      2. Walk target_branch from HEAD up to max_target_walk commits looking for a
+         commit whose tree exists in that map.
+      3. Return the corresponding source_ref commit — the rebase base.
 
-    Returns:
-        Commit hash on source_ref that matches a commit on target_branch, or None
+    If target HEAD's tree isn't on source, we walk back on target a bit (some
+    master-only hotfixes may not have been mirrored to develop); the warning
+    explains the divergence so it can be reconciled before release.
+
+    Returns the source_ref commit, or None if no tree match is found.  Callers
+    should NOT silently fall back to merge-base — that produces a much older
+    rebase base and an enormous, conflict-heavy rebase.
     """
     original_dir = os.getcwd()
-
-    def get_commit_patch_id(commit: str) -> Optional[str]:
-        """Helper to get patch-id for a commit, handling binary data properly."""
-        try:
-            # Get the patch (don't decode as text - may have binary data)
-            result = subprocess.run([
-                'git', 'show', commit, '--format=', '--patch'
-            ], capture_output=True, check=True)
-
-            if not result.stdout:
-                return None
-
-            # Calculate patch-id (work with bytes)
-            patch_result = subprocess.run([
-                'git', 'patch-id'
-            ], input=result.stdout, capture_output=True)
-
-            if patch_result.stdout:
-                return patch_result.stdout.decode('utf-8', errors='ignore').split()[0]
-        except subprocess.CalledProcessError:
-            pass
-        return None
 
     try:
         os.chdir(repo_path)
 
-        # First, resolve source_ref to a commit
-        result = subprocess.run([
-            'git', 'rev-parse', source_ref
-        ], capture_output=True, text=True, check=True)
-        source_head = result.stdout.strip()
+        # Resolve target HEAD for log messages
+        target_head = subprocess.run(
+            ['git', 'rev-parse', target_branch],
+            capture_output=True, text=True, check=True
+        ).stdout.strip()
 
-        logging.debug(f"Source ref {source_ref} resolves to {source_head[:8]}")
+        # Build tree → commit map for source_ref. git log is reverse-chronological,
+        # so the first time we see a tree, that's the most recent commit with it.
+        result = subprocess.run(
+            ['git', 'log', '--pretty=format:%H %T', source_ref],
+            capture_output=True, text=True, check=True
+        )
+        tree_to_source = {}
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) == 2:
+                commit, tree = parts
+                if tree not in tree_to_source:
+                    tree_to_source[tree] = commit
+        logging.debug(f"Indexed {len(tree_to_source)} unique trees on {source_ref}")
 
-        # Get commits from source_ref going backwards
-        result = subprocess.run([
-            'git', 'rev-list', '--max-count', str(max_commits), source_ref
-        ], capture_output=True, text=True, check=True)
+        # Walk target_branch from HEAD looking for a tree present on source_ref.
+        result = subprocess.run(
+            ['git', 'log', '--pretty=format:%H %T', '--max-count', str(max_target_walk), target_branch],
+            capture_output=True, text=True, check=True
+        )
+        for i, line in enumerate(result.stdout.splitlines()):
+            parts = line.split()
+            if len(parts) != 2:
+                continue
+            target_commit, target_tree = parts
+            if target_tree in tree_to_source:
+                source_commit = tree_to_source[target_tree]
+                if i == 0:
+                    logging.info(
+                        f"Tree-match: {target_branch} HEAD ({target_commit[:8]}) "
+                        f"== {source_ref} commit {source_commit[:8]}"
+                    )
+                else:
+                    logging.warning(
+                        f"{target_branch} HEAD ({target_head[:8]}) has no tree-match on {source_ref}; "
+                        f"using match {i} commits back: {target_branch}~{i} ({target_commit[:8]}) "
+                        f"== {source_ref} {source_commit[:8]}."
+                    )
+                    logging.warning(
+                        f"{target_branch} has {i} commit(s) whose trees aren't on {source_ref}; "
+                        "those changes will be preserved on the release branch but may produce "
+                        "conflicts during rebase. Consider backporting them to develop first."
+                    )
+                return source_commit
 
-        source_commits = result.stdout.strip().split('\n') if result.stdout.strip() else []
-        logging.info(f"Checking {len(source_commits)} commits from {source_ref}")
-
-        # Build patch-id map for source commits
-        source_patch_map = {}
-        for commit in source_commits:
-            patch_id = get_commit_patch_id(commit)
-            if patch_id:
-                source_patch_map[patch_id] = commit
-
-        # Get commits from target_branch going backwards
-        result = subprocess.run([
-            'git', 'rev-list', '--max-count', str(max_commits), target_branch
-        ], capture_output=True, text=True, check=True)
-
-        target_commits = result.stdout.strip().split('\n') if result.stdout.strip() else []
-        logging.info(f"Checking {len(target_commits)} commits from {target_branch}")
-
-        # Walk through target commits looking for matches
-        for i, target_commit in enumerate(target_commits):
-            target_patch_id = get_commit_patch_id(target_commit)
-
-            if target_patch_id and target_patch_id in source_patch_map:
-                matching_source = source_patch_map[target_patch_id]
-
-                # Log what we found
-                result = subprocess.run([
-                    'git', 'log', '--oneline', '-1', matching_source
-                ], capture_output=True, text=True)
-                source_msg = result.stdout.strip()
-                logging.info(f"Found matching commit: {source_msg}")
-
-                # If this is the HEAD of target and matches source HEAD, no rebase needed
-                if i == 0 and matching_source == source_head:
-                    logging.info(f"Source HEAD matches target HEAD - no commits to rebase!")
-
-                return matching_source
-
-        logging.warning(f"No matching commits found in first {max_commits} commits")
-
-        # Fall back to merge-base as last resort
-        try:
-            result = subprocess.run([
-                'git', 'merge-base', target_branch, source_ref
-            ], capture_output=True, text=True, check=True)
-            merge_base = result.stdout.strip()
-            logging.warning(f"Using merge-base as fallback: {merge_base[:8]}")
-            return merge_base
-        except:
-            return None
+        logging.error(
+            f"No commit on {target_branch} within the last {max_target_walk} commits has a tree "
+            f"present on {source_ref}. {target_branch} has diverged significantly — "
+            "manual reconciliation is needed before running --release-to-master for this repo."
+        )
+        return None
 
     except subprocess.CalledProcessError as e:
         logging.error(f"Error finding rebase base: {e}")
@@ -1445,22 +1429,20 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
 
         logging.info(f"Release workflow: {source_ref} -> {target_branch}")
 
-        # Find a sensible rebase base by patch-id matching, falling back to merge-base
+        # Find the rebase base by tree-hash matching.  Failure means master has
+        # diverged from develop in a way the script can't auto-resolve — fail
+        # loudly rather than fall back to merge-base (which would try to rebase
+        # the entire history since the last release branch divergence).
         logging.info(f"Finding rebase base for {repo_url}...")
         rebase_base = find_rebase_base(clone_path, source_ref, f'origin/{target_branch}')
 
         if not rebase_base:
-            logging.warning("Could not find rebase base using patch-id, using merge-base")
-            try:
-                result_cmd = subprocess.run(
-                    ['git', 'merge-base', f'origin/{target_branch}', source_ref],
-                    cwd=clone_path, capture_output=True, text=True, check=True
-                )
-                rebase_base = result_cmd.stdout.strip()
-            except subprocess.CalledProcessError:
-                result.success = False
-                result.error_message = "Failed to find rebase base"
-                return result
+            result.success = False
+            result.error_message = (
+                f"Could not find a tree-match between {target_branch} and {source_ref}. "
+                f"This repo needs manual reconciliation before --release-to-master."
+            )
+            return result
 
         # Detect fast-forward case: target HEAD is already on source ref
         is_fast_forward = False
