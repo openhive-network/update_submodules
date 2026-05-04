@@ -1577,6 +1577,44 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
                     result.error_message = str(e)
                     return result
 
+                # Post-rebase reconciliation: if HEAD's tree differs from the source
+                # ref's tree, develop's non-linear history was linearized in a way
+                # that produced an intermediate state at HEAD (e.g., a delete commit
+                # placed before a related modify commit, leaving the file modified
+                # instead of deleted).  Add one alignment commit so the release
+                # branch's final tree exactly matches develop's tip.
+                try:
+                    head_tree = subprocess.run(['git', 'rev-parse', 'HEAD^{tree}'],
+                                               cwd=clone_path, capture_output=True, text=True, check=True).stdout.strip()
+                    src_tree = subprocess.run(['git', 'rev-parse', f'{source_ref}^{{tree}}'],
+                                              cwd=clone_path, capture_output=True, text=True, check=True).stdout.strip()
+                    if head_tree != src_tree:
+                        logging.warning(
+                            f"Post-rebase tree {head_tree[:8]} differs from {source_ref} tip {src_tree[:8]} — "
+                            f"non-linear develop history was linearized into an intermediate state.  "
+                            f"Adding a tree-alignment commit so the release branch matches develop's tip."
+                        )
+                        # Replace index + working tree with source's tree, then commit the diff.
+                        subprocess.run(['git', 'read-tree', '--reset', '-u', source_ref],
+                                       cwd=clone_path, check=True, capture_output=True, text=True)
+                        diff_check = subprocess.run(['git', 'diff', '--cached', '--quiet'],
+                                                    cwd=clone_path, capture_output=True, text=True)
+                        if diff_check.returncode != 0:
+                            subprocess.run(
+                                ['git', 'commit', '-m',
+                                 f'Align release branch to {source_ref} tip\n\n'
+                                 f'Reconciles drift introduced by rebase linearization of '
+                                 f"{source_ref}'s non-linear history."],
+                                cwd=clone_path, check=True, capture_output=True, text=True
+                            )
+                            conflicts.append('reconciliation:tree_sync')
+                            logging.info("Added tree-alignment commit")
+                except subprocess.CalledProcessError as e:
+                    logging.error(f"Tree reconciliation failed: {e.stderr if e.stderr else e}")
+                    result.success = False
+                    result.error_message = f"Tree reconciliation failed: {e}"
+                    return result
+
             repo = Repo(clone_path)
             result.repo_object = repo
             desired_ref_actual = release_branch
