@@ -356,88 +356,98 @@ def perform_release_rebase(repo_path: str, rebase_base: str, source_branch: str,
             logging.debug(f"Rebase iteration {iteration}, status lines: {len(status_lines)}")
 
             conflicts_found = False
-            for line in status_lines:
-                if line.startswith('UU ') or line.startswith('AA '):
-                    # Both modified - conflict
-                    file_path = line[3:].strip()
+            # Conflict status taxonomy (XY where X=ours/upstream/master, Y=theirs/develop):
+            #   UU, AA       — both modified or both added → take theirs (develop wins)
+            #   DU           — we deleted, they updated    → take theirs (re-add from develop)
+            #   UA           — they added (we have nothing) → take theirs
+            #   UD, DD       — they deleted (or both did)  → accept deletion
+            #   AU           — we added (they have nothing) → drop our addition
+            take_theirs_statuses = ('UU', 'AA', 'DU', 'UA')
+            accept_delete_statuses = ('UD', 'DD', 'AU')
 
-                    # Check if it's a submodule by looking at .gitmodules
-                    is_submodule = False
-                    try:
-                        # Get all submodule paths from .gitmodules
-                        result = subprocess.run([
-                            'git', 'config', '--file', '.gitmodules',
-                            '--get-regexp', 'path'
-                        ], capture_output=True, text=True)
-                        if result.returncode == 0:
-                            # Check if our file_path matches any submodule path
-                            for line in result.stdout.strip().split('\n'):
-                                if line and file_path in line:
-                                    # Extract the actual path value
-                                    parts = line.split()
-                                    if len(parts) >= 2 and parts[-1] == file_path:
-                                        is_submodule = True
-                                        break
-                    except:
-                        pass
+            for status_line in status_lines:
+                if len(status_line) < 4:
+                    continue
+                status = status_line[:2]
+                if status not in take_theirs_statuses and status not in accept_delete_statuses:
+                    continue
+                file_path = status_line[3:].strip()
 
+                # Check if it's a submodule by looking at .gitmodules
+                is_submodule = False
+                try:
+                    gm_result = subprocess.run([
+                        'git', 'config', '--file', '.gitmodules',
+                        '--get-regexp', 'path'
+                    ], capture_output=True, text=True)
+                    if gm_result.returncode == 0:
+                        for gm_line in gm_result.stdout.strip().split('\n'):
+                            parts = gm_line.split()
+                            if len(parts) >= 2 and parts[-1] == file_path:
+                                is_submodule = True
+                                break
+                except Exception:
+                    pass
+
+                if status in accept_delete_statuses:
+                    # Develop dropped (or both did) this path — propagate the deletion.
+                    logging.debug(f"Accepting deletion for {file_path} (status {status})")
                     if is_submodule:
-                        # Submodule conflict - simpler approach
-                        logging.debug(f"Resolving submodule conflict: {file_path}")
-
-                        # During rebase of develop onto master, we want to keep develop's submodule versions
-                        # The simplest approach is to use git rm + git add to accept the incoming version
-
-                        # Remove the conflicted submodule entry
-                        subprocess.run(['git', 'rm', '--cached', file_path],
-                                     capture_output=True, text=True)
-
-                        # Get the commit that develop wants for this submodule
-                        theirs_commit_result = subprocess.run([
-                            'git', 'ls-tree', 'REBASE_HEAD', file_path
-                        ], capture_output=True, text=True)
-
-                        if theirs_commit_result.returncode == 0 and theirs_commit_result.stdout:
-                            # Extract the commit hash from the output
-                            # Format is: "160000 commit <hash>\t<path>"
-                            parts = theirs_commit_result.stdout.split()
-                            if len(parts) >= 3:
-                                theirs_commit = parts[2]
-                                logging.debug(f"Will use {file_path} at commit {theirs_commit} from develop")
-
-                                # Update the index to point to this commit
-                                # This is equivalent to accepting "theirs" version
-                                update_result = subprocess.run([
-                                    'git', 'update-index', '--add', '--cacheinfo',
-                                    '160000', theirs_commit, file_path
-                                ], capture_output=True, text=True)
-
-                                if update_result.returncode != 0:
-                                    logging.warning(f"Could not update index for {file_path}, trying alternative")
-                                    # Alternative: just stage the current state
-                                    subprocess.run(['git', 'add', file_path], capture_output=True)
-                        else:
-                            # Fallback: just add the current state
-                            logging.debug(f"Could not determine theirs commit for {file_path}, using current state")
-                            subprocess.run(['git', 'add', file_path], capture_output=True)
-
-                        conflicts_resolved.append(f"submodule:{file_path}")
-                        conflicts_found = True
-                    elif file_path.endswith(('.yml', '.yaml')):
-                        # YAML conflict - take theirs (from source branch)
-                        logging.debug(f"Resolving YAML conflict: {file_path}")
-                        subprocess.run(['git', 'checkout', '--theirs', file_path], check=True)
-                        subprocess.run(['git', 'add', file_path], check=True)
-                        conflicts_resolved.append(f"yaml:{file_path}")
-                        conflicts_found = True
+                        subprocess.run(['git', 'rm', '--cached', '-f', file_path],
+                                       capture_output=True, text=True)
                     else:
-                        # Any other file conflict - take theirs (from source branch) for release
-                        # Log a warning since we don't expect conflicts in other files
-                        logging.warning(f"Unexpected conflict in {file_path} - taking version from develop branch")
-                        subprocess.run(['git', 'checkout', '--theirs', file_path], check=True)
-                        subprocess.run(['git', 'add', file_path], check=True)
-                        conflicts_resolved.append(f"other:{file_path}")
-                        conflicts_found = True
+                        subprocess.run(['git', 'rm', '-f', file_path],
+                                       capture_output=True, text=True)
+                    conflicts_resolved.append(f"deleted:{file_path}")
+                    conflicts_found = True
+                    continue
+
+                # status in take_theirs_statuses — develop's version wins
+                if is_submodule:
+                    logging.debug(f"Resolving submodule conflict: {file_path} (status {status})")
+
+                    # Clear stale index entries for this path then write develop's gitlink.
+                    subprocess.run(['git', 'rm', '--cached', '-f', file_path],
+                                   capture_output=True, text=True)
+
+                    # Get the commit that develop wants for this submodule.
+                    theirs_commit_result = subprocess.run([
+                        'git', 'ls-tree', 'REBASE_HEAD', file_path
+                    ], capture_output=True, text=True)
+
+                    if theirs_commit_result.returncode == 0 and theirs_commit_result.stdout:
+                        # Format: "160000 commit <hash>\t<path>"
+                        parts = theirs_commit_result.stdout.split()
+                        if len(parts) >= 3:
+                            theirs_commit = parts[2]
+                            logging.debug(f"Will use {file_path} at commit {theirs_commit} from develop")
+                            update_result = subprocess.run([
+                                'git', 'update-index', '--add', '--cacheinfo',
+                                '160000', theirs_commit, file_path
+                            ], capture_output=True, text=True)
+                            if update_result.returncode != 0:
+                                logging.warning(f"Could not update index for {file_path}, trying alternative")
+                                subprocess.run(['git', 'add', file_path], capture_output=True)
+                    else:
+                        # Develop has no entry for this path either; treat as deletion.
+                        logging.debug(f"REBASE_HEAD has no entry for {file_path}; leaving deleted")
+
+                    conflicts_resolved.append(f"submodule:{file_path}")
+                    conflicts_found = True
+                elif file_path.endswith(('.yml', '.yaml')):
+                    logging.debug(f"Resolving YAML conflict: {file_path} (status {status})")
+                    subprocess.run(['git', 'checkout', '--theirs', '--', file_path], check=True)
+                    subprocess.run(['git', 'add', file_path], check=True)
+                    conflicts_resolved.append(f"yaml:{file_path}")
+                    conflicts_found = True
+                else:
+                    # Any other file conflict - take theirs for release.  Log so the
+                    # human reviewing the run can spot anything weird.
+                    logging.warning(f"Unexpected conflict in {file_path} (status {status}) - taking version from develop branch")
+                    subprocess.run(['git', 'checkout', '--theirs', '--', file_path], check=True)
+                    subprocess.run(['git', 'add', file_path], check=True)
+                    conflicts_resolved.append(f"other:{file_path}")
+                    conflicts_found = True
 
             if not conflicts_found:
                 # No conflicts found, but rebase might still be in progress
