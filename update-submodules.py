@@ -276,9 +276,8 @@ def perform_release_rebase(repo_path: str, rebase_base: str, source_branch: str,
     Args:
         repo_path: Path to the repository
         rebase_base: Commit to use as the starting point for rebase
-        source_branch: The source ref (e.g. 'origin/develop') used to resolve
-                       conflicts — every conflicted path is aligned with
-                       source_branch's TIP, which is the desired end state.
+        source_branch: Kept for diagnostics/compat; conflict resolution reads
+                       directly from REBASE_HEAD on each iteration.
         target_branch: Branch to rebase onto (e.g., origin/master)
         commit_count: Number of commits being rebased (for setting iteration limit)
 
@@ -359,12 +358,17 @@ def perform_release_rebase(repo_path: str, rebase_base: str, source_branch: str,
             logging.debug(f"Rebase iteration {iteration}, status lines: {len(status_lines)}")
 
             conflicts_found = False
-            # Resolution rule for release-to-master: every conflicted path is aligned
-            # with source_branch's TIP (origin/develop) — that's the desired end state
-            # of the rebase, so any intermediate-state conflict is resolved by jumping
-            # straight there.  This handles every unmerged status (UU/AA/DU/UA/UD/DD/AU)
-            # uniformly and doesn't depend on .gitmodules being present in the working
-            # tree (it isn't, when develop has dropped a submodule that master still has).
+            # Resolution rule for release-to-master: take REBASE_HEAD's version of
+            # every conflicted path.  REBASE_HEAD is the commit currently being
+            # applied (theirs side of the cherry-pick), so this is "develop wins"
+            # at the right granularity — each commit sees the state it expects,
+            # rather than jumping straight to source's final tip (which causes
+            # subsequent commits to re-conflict against future-state files).
+            #
+            # Reads mode + hash directly from `git ls-tree REBASE_HEAD`, so the
+            # logic doesn't depend on .gitmodules being present in the working
+            # tree — important because develop sometimes drops submodules that
+            # master still has, taking .gitmodules with them.
             UNMERGED = ('UU', 'AA', 'DU', 'UA', 'UD', 'DD', 'AU')
 
             for status_line in status_lines:
@@ -375,48 +379,48 @@ def perform_release_rebase(repo_path: str, rebase_base: str, source_branch: str,
                     continue
                 file_path = status_line[3:].strip()
 
-                # What does source_branch's tip have at this path?
-                src_lookup = subprocess.run(
-                    ['git', 'ls-tree', source_branch, '--', file_path],
+                # What does REBASE_HEAD (the commit being applied) have at this path?
+                rh_lookup = subprocess.run(
+                    ['git', 'ls-tree', 'REBASE_HEAD', '--', file_path],
                     capture_output=True, text=True
                 )
-                src_has_path = bool(src_lookup.returncode == 0 and src_lookup.stdout.strip())
+                rh_has_path = bool(rh_lookup.returncode == 0 and rh_lookup.stdout.strip())
 
-                # Always clear the conflicted entry from the index first, then re-stage
-                # at source's version (or leave gone if source doesn't have it).
+                # Clear the conflicted entry from the index, then re-stage at
+                # REBASE_HEAD's version (or leave gone if REBASE_HEAD doesn't have it).
                 subprocess.run(['git', 'rm', '--cached', '-f', '--', file_path],
                                capture_output=True, text=True)
 
-                if src_has_path:
-                    parts = src_lookup.stdout.split()
+                if rh_has_path:
+                    parts = rh_lookup.stdout.split()
                     if len(parts) >= 3:
-                        mode = parts[0]      # e.g. '100644', '100755', '120000', '160000'
+                        mode = parts[0]      # '100644', '100755', '120000', '160000', ...
                         obj_hash = parts[2]
                         update_result = subprocess.run(
                             ['git', 'update-index', '--add', '--cacheinfo', mode, obj_hash, file_path],
                             capture_output=True, text=True
                         )
                         if update_result.returncode != 0:
-                            logging.warning(f"Could not stage {file_path} at source's version: {update_result.stderr.strip()}")
+                            logging.warning(f"Could not stage {file_path} at REBASE_HEAD's version: {update_result.stderr.strip()}")
 
                         if mode == '160000':
                             kind = 'submodule'
-                            logging.debug(f"Resolved submodule {file_path} → {obj_hash[:8]} from source (status {status})")
+                            logging.debug(f"Resolved submodule {file_path} → {obj_hash[:8]} from REBASE_HEAD (status {status})")
                         else:
                             # Restore working tree from index for regular files / symlinks
                             subprocess.run(['git', 'checkout-index', '-f', '--', file_path],
                                            capture_output=True, text=True)
                             kind = 'yaml' if file_path.endswith(('.yml', '.yaml')) else 'other'
                             if kind == 'other':
-                                logging.warning(f"Unexpected conflict in {file_path} (status {status}) - restoring source's version")
+                                logging.debug(f"Resolved {file_path} from REBASE_HEAD (status {status})")
                             else:
-                                logging.debug(f"Resolved YAML {file_path} from source (status {status})")
+                                logging.debug(f"Resolved YAML {file_path} from REBASE_HEAD (status {status})")
                         conflicts_resolved.append(f"{kind}:{file_path}")
                         conflicts_found = True
                         continue
 
-                # Source doesn't have this path → propagate the deletion.
-                logging.debug(f"Path {file_path} absent on source — removing (status {status})")
+                # REBASE_HEAD doesn't have this path → accept its absence.
+                logging.debug(f"Path {file_path} absent on REBASE_HEAD — removing (status {status})")
                 full_path = os.path.join(repo_path, file_path)
                 if os.path.isdir(full_path) and not os.path.islink(full_path):
                     shutil.rmtree(full_path, ignore_errors=True)
