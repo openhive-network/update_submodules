@@ -171,7 +171,7 @@ def delete_gitlab_tag_via_api(repo_url, tag):
 
 def find_rebase_base(repo_path: str, source_ref: str = 'develop',
                      target_branch: str = 'origin/master',
-                     max_target_walk: int = 200) -> Optional[str]:
+                     max_target_walk: int = 2000) -> Optional[str]:
     """
     Find the commit on source_ref whose git tree matches target_branch's HEAD.
 
@@ -248,9 +248,10 @@ def find_rebase_base(repo_path: str, source_ref: str = 'develop',
                         f"== {source_ref} {source_commit[:8]}."
                     )
                     logging.warning(
-                        f"{target_branch} has {i} commit(s) whose trees aren't on {source_ref}; "
-                        "those changes will be preserved on the release branch but may produce "
-                        "conflicts during rebase. Consider backporting them to develop first."
+                        f"{target_branch} has {i} commit(s) past its last {source_ref} sync point. "
+                        "The rebase will produce a release branch with develop's tree on top of "
+                        f"{target_branch} HEAD; the post-rebase tree-alignment step will reconcile "
+                        f"any drift so the final tree matches {source_ref}'s tip."
                     )
                 return source_commit
 
