@@ -9,8 +9,9 @@ import argparse
 import logging
 import requests
 import configparser
+import subprocess
 from dataclasses import dataclass
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from collections import defaultdict
 from ruamel.yaml import YAML
 from git import Repo, GitCommandError, PushInfo
@@ -31,7 +32,10 @@ class RepoOperationResult:
     error_message: Optional[str] = None
     repo_object: Optional[Repo] = None  # Store the repo object for Phase 2
     settings: Dict = None  # Store repository settings for Phase 2
-    
+    rebase_performed: bool = False  # Release mode: track if rebase was done
+    conflicts_resolved: List = None  # Release mode: track resolved conflicts
+    sanity_check_passed: bool = True  # Release mode: track sanity check result
+
     def __post_init__(self):
         if self.submodules_updated is None:
             self.submodules_updated = {}
@@ -39,6 +43,8 @@ class RepoOperationResult:
             self.yaml_files_updated = {}
         if self.settings is None:
             self.settings = {}
+        if self.conflicts_resolved is None:
+            self.conflicts_resolved = []
 
 def setup_logging(log_level):
     """Configure the logging settings."""
@@ -65,6 +71,10 @@ def parse_arguments():
     parser.add_argument('--cleanup', action='store_true', help='Clean up branches, tags, and MRs from a previous failed run.')
     parser.add_argument('--cleanup-tag', type=str, help='Specific tag to clean up when using --cleanup.')
     parser.add_argument('--push-delay', type=int, default=15, help='Delay in seconds between pushing to each repository (default: 15). Set to 0 to disable.')
+    parser.add_argument('--release-to-master', action='store_true', help='Rebase source commits onto target branch for release. Defaults config to repos.yaml.master.')
+    parser.add_argument('--no-push-tags', action='store_true', help='Create tags locally but do not push them to remote (useful for release validation).')
+    parser.add_argument('--force', action='store_true', help='Skip prompts and force continue on warnings (release mode only).')
+    parser.add_argument('--config', type=str, default=None, help='Path to the YAML config file. Defaults to repos.yaml, or repos.yaml.master when --release-to-master is set.')
     return parser.parse_args()
 
 def get_gitlab_credentials():
@@ -154,6 +164,463 @@ def delete_gitlab_tag_via_api(repo_url, tag):
         logging.error(f"Error deleting tag via API: {e}")
         return False
 
+# ============================================================================
+# NEW FUNCTIONS FOR RELEASE WORKFLOW
+# ============================================================================
+
+def find_rebase_base(repo_path: str, source_ref: str = 'develop',
+                     target_branch: str = 'origin/master', max_commits: int = 500) -> Optional[str]:
+    """
+    Find the commit on source_ref that corresponds to a commit on target_branch.
+
+    Walks backwards from HEAD of both branches looking for matching commits by patch-id.
+    This handles rebased commits and doesn't assume any specific commit patterns.
+
+    Args:
+        repo_path: Path to the repository
+        source_ref: Reference to rebase from (branch, tag, or commit)
+        target_branch: Branch to rebase onto
+        max_commits: Maximum number of commits to check on each branch
+
+    Returns:
+        Commit hash on source_ref that matches a commit on target_branch, or None
+    """
+    original_dir = os.getcwd()
+
+    def get_commit_patch_id(commit: str) -> Optional[str]:
+        """Helper to get patch-id for a commit, handling binary data properly."""
+        try:
+            # Get the patch (don't decode as text - may have binary data)
+            result = subprocess.run([
+                'git', 'show', commit, '--format=', '--patch'
+            ], capture_output=True, check=True)
+
+            if not result.stdout:
+                return None
+
+            # Calculate patch-id (work with bytes)
+            patch_result = subprocess.run([
+                'git', 'patch-id'
+            ], input=result.stdout, capture_output=True)
+
+            if patch_result.stdout:
+                return patch_result.stdout.decode('utf-8', errors='ignore').split()[0]
+        except subprocess.CalledProcessError:
+            pass
+        return None
+
+    try:
+        os.chdir(repo_path)
+
+        # First, resolve source_ref to a commit
+        result = subprocess.run([
+            'git', 'rev-parse', source_ref
+        ], capture_output=True, text=True, check=True)
+        source_head = result.stdout.strip()
+
+        logging.debug(f"Source ref {source_ref} resolves to {source_head[:8]}")
+
+        # Get commits from source_ref going backwards
+        result = subprocess.run([
+            'git', 'rev-list', '--max-count', str(max_commits), source_ref
+        ], capture_output=True, text=True, check=True)
+
+        source_commits = result.stdout.strip().split('\n') if result.stdout.strip() else []
+        logging.info(f"Checking {len(source_commits)} commits from {source_ref}")
+
+        # Build patch-id map for source commits
+        source_patch_map = {}
+        for commit in source_commits:
+            patch_id = get_commit_patch_id(commit)
+            if patch_id:
+                source_patch_map[patch_id] = commit
+
+        # Get commits from target_branch going backwards
+        result = subprocess.run([
+            'git', 'rev-list', '--max-count', str(max_commits), target_branch
+        ], capture_output=True, text=True, check=True)
+
+        target_commits = result.stdout.strip().split('\n') if result.stdout.strip() else []
+        logging.info(f"Checking {len(target_commits)} commits from {target_branch}")
+
+        # Walk through target commits looking for matches
+        for i, target_commit in enumerate(target_commits):
+            target_patch_id = get_commit_patch_id(target_commit)
+
+            if target_patch_id and target_patch_id in source_patch_map:
+                matching_source = source_patch_map[target_patch_id]
+
+                # Log what we found
+                result = subprocess.run([
+                    'git', 'log', '--oneline', '-1', matching_source
+                ], capture_output=True, text=True)
+                source_msg = result.stdout.strip()
+                logging.info(f"Found matching commit: {source_msg}")
+
+                # If this is the HEAD of target and matches source HEAD, no rebase needed
+                if i == 0 and matching_source == source_head:
+                    logging.info(f"Source HEAD matches target HEAD - no commits to rebase!")
+
+                return matching_source
+
+        logging.warning(f"No matching commits found in first {max_commits} commits")
+
+        # Fall back to merge-base as last resort
+        try:
+            result = subprocess.run([
+                'git', 'merge-base', target_branch, source_ref
+            ], capture_output=True, text=True, check=True)
+            merge_base = result.stdout.strip()
+            logging.warning(f"Using merge-base as fallback: {merge_base[:8]}")
+            return merge_base
+        except:
+            return None
+
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error finding rebase base: {e}")
+        return None
+    finally:
+        os.chdir(original_dir)
+
+
+def perform_release_rebase(repo_path: str, rebase_base: str, source_branch: str,
+                          target_branch: str, commit_count: int = None) -> Tuple[bool, List[str]]:
+    """
+    Rebase the current branch (created from source_branch) onto target_branch.
+
+    Args:
+        repo_path: Path to the repository
+        rebase_base: Commit to use as the starting point for rebase
+        source_branch: Not used anymore (kept for compatibility)
+        target_branch: Branch to rebase onto (e.g., origin/master)
+        commit_count: Number of commits being rebased (for setting iteration limit)
+
+    Returns:
+        Tuple of (success: bool, conflicts_resolved: list)
+    """
+    original_dir = os.getcwd()
+    conflicts_resolved = []
+
+    try:
+        os.chdir(repo_path)
+
+        # Set up environment to prevent editor prompts
+        env = os.environ.copy()
+        env['GIT_EDITOR'] = 'true'  # Use 'true' command as editor (always succeeds without opening)
+        env['EDITOR'] = 'true'
+
+        # Start rebase
+        # We're on a release branch (created from develop) and want to rebase it onto master
+        # This preserves the original develop branch while applying commits to release branch
+
+        logging.info(f"Rebasing current branch onto {target_branch} from {rebase_base[:8]}...")
+
+        # Rebase current branch onto target, keeping only commits after rebase_base
+        result = subprocess.run([
+            'git', '-c', 'core.editor=true', 'rebase', '--onto', target_branch, rebase_base, 'HEAD'
+        ], capture_output=True, text=True, env=env)
+
+        if result.returncode == 0:
+            logging.info("Rebase completed without conflicts")
+            return True, conflicts_resolved
+
+        # Handle conflicts in a loop
+        # Set a generous limit: 3x the number of commits (to handle multiple loops per commit)
+        # Default to 1000 if commit_count not provided
+        max_iterations = (commit_count * 3) if commit_count else 1000
+        iteration = 0
+        consecutive_same_state = 0
+        last_status = None
+
+        while iteration < max_iterations:
+            iteration += 1
+
+            # Check if rebase is still in progress
+            if not (os.path.exists('.git/rebase-merge') or os.path.exists('.git/rebase-apply')):
+                logging.debug("Rebase finished - no rebase in progress")
+                break
+
+            # Get current status
+            result = subprocess.run(['git', 'status', '--porcelain'],
+                                  capture_output=True, text=True)
+            status_lines = result.stdout.strip().split('\n') if result.stdout.strip() else []
+            current_status = result.stdout.strip()
+
+            # Detect if we're stuck in the same state
+            if current_status == last_status:
+                consecutive_same_state += 1
+                if consecutive_same_state > 10:  # Increased from 5 to 10 to allow for slower operations
+                    logging.error(f"Stuck in same state for {consecutive_same_state} iterations")
+                    logging.error(f"Status: {current_status[:200]}")
+                    # Try to get more info about what's wrong
+                    info_result = subprocess.run(['git', 'status'], capture_output=True, text=True)
+                    logging.error(f"Full status:\n{info_result.stdout[:1000]}")
+
+                    # Also check what git rebase --continue says
+                    cherry_pick_result = subprocess.run(['git', 'rebase', '--continue'],
+                                                   capture_output=True, text=True, env=env)
+                    logging.error(f"Rebase continue output: {cherry_pick_result.stderr[:500]}")
+
+                    return False, conflicts_resolved
+            else:
+                consecutive_same_state = 0
+                last_status = current_status
+
+            if iteration % 100 == 0:
+                logging.info(f"Rebase progress: iteration {iteration}/{max_iterations}")
+
+            logging.debug(f"Rebase iteration {iteration}, status lines: {len(status_lines)}")
+
+            conflicts_found = False
+            for line in status_lines:
+                if line.startswith('UU ') or line.startswith('AA '):
+                    # Both modified - conflict
+                    file_path = line[3:].strip()
+
+                    # Check if it's a submodule by looking at .gitmodules
+                    is_submodule = False
+                    try:
+                        # Get all submodule paths from .gitmodules
+                        result = subprocess.run([
+                            'git', 'config', '--file', '.gitmodules',
+                            '--get-regexp', 'path'
+                        ], capture_output=True, text=True)
+                        if result.returncode == 0:
+                            # Check if our file_path matches any submodule path
+                            for line in result.stdout.strip().split('\n'):
+                                if line and file_path in line:
+                                    # Extract the actual path value
+                                    parts = line.split()
+                                    if len(parts) >= 2 and parts[-1] == file_path:
+                                        is_submodule = True
+                                        break
+                    except:
+                        pass
+
+                    if is_submodule:
+                        # Submodule conflict - simpler approach
+                        logging.debug(f"Resolving submodule conflict: {file_path}")
+
+                        # During rebase of develop onto master, we want to keep develop's submodule versions
+                        # The simplest approach is to use git rm + git add to accept the incoming version
+
+                        # Remove the conflicted submodule entry
+                        subprocess.run(['git', 'rm', '--cached', file_path],
+                                     capture_output=True, text=True)
+
+                        # Get the commit that develop wants for this submodule
+                        theirs_commit_result = subprocess.run([
+                            'git', 'ls-tree', 'REBASE_HEAD', file_path
+                        ], capture_output=True, text=True)
+
+                        if theirs_commit_result.returncode == 0 and theirs_commit_result.stdout:
+                            # Extract the commit hash from the output
+                            # Format is: "160000 commit <hash>\t<path>"
+                            parts = theirs_commit_result.stdout.split()
+                            if len(parts) >= 3:
+                                theirs_commit = parts[2]
+                                logging.debug(f"Will use {file_path} at commit {theirs_commit} from develop")
+
+                                # Update the index to point to this commit
+                                # This is equivalent to accepting "theirs" version
+                                update_result = subprocess.run([
+                                    'git', 'update-index', '--add', '--cacheinfo',
+                                    '160000', theirs_commit, file_path
+                                ], capture_output=True, text=True)
+
+                                if update_result.returncode != 0:
+                                    logging.warning(f"Could not update index for {file_path}, trying alternative")
+                                    # Alternative: just stage the current state
+                                    subprocess.run(['git', 'add', file_path], capture_output=True)
+                        else:
+                            # Fallback: just add the current state
+                            logging.debug(f"Could not determine theirs commit for {file_path}, using current state")
+                            subprocess.run(['git', 'add', file_path], capture_output=True)
+
+                        conflicts_resolved.append(f"submodule:{file_path}")
+                        conflicts_found = True
+                    elif file_path.endswith(('.yml', '.yaml')):
+                        # YAML conflict - take theirs (from source branch)
+                        logging.debug(f"Resolving YAML conflict: {file_path}")
+                        subprocess.run(['git', 'checkout', '--theirs', file_path], check=True)
+                        subprocess.run(['git', 'add', file_path], check=True)
+                        conflicts_resolved.append(f"yaml:{file_path}")
+                        conflicts_found = True
+                    else:
+                        # Any other file conflict - take theirs (from source branch) for release
+                        # Log a warning since we don't expect conflicts in other files
+                        logging.warning(f"Unexpected conflict in {file_path} - taking version from develop branch")
+                        subprocess.run(['git', 'checkout', '--theirs', file_path], check=True)
+                        subprocess.run(['git', 'add', file_path], check=True)
+                        conflicts_resolved.append(f"other:{file_path}")
+                        conflicts_found = True
+
+            if not conflicts_found:
+                # No conflicts found, but rebase might still be in progress
+                # Check if we need to continue
+                if os.path.exists('.git/rebase-merge') or os.path.exists('.git/rebase-apply'):
+                    # Try to continue
+                    result = subprocess.run(['git', '-c', 'core.editor=true', 'rebase', '--continue'],
+                                          capture_output=True, text=True, env=env)
+                    if result.returncode != 0:
+                        if 'nothing to commit' in result.stderr:
+                            # Empty commit, skip it
+                            logging.debug("Skipping empty commit")
+                            subprocess.run(['git', '-c', 'core.editor=true', 'rebase', '--skip'],
+                                         check=True, env=env)
+                        elif 'You must edit all merge conflicts' in result.stderr or 'fix conflicts' in result.stderr.lower():
+                            # There are still unresolved conflicts, but we didn't detect them
+                            # This might be a different type of conflict marker
+                            logging.warning(f"Unhandled conflict detected at iteration {iteration}")
+                            logging.warning(f"stderr: {result.stderr[:500]}")
+                            # Check if we're stuck in a loop
+                            if iteration > 50:
+                                logging.error("Possible infinite loop detected - same conflict not resolving")
+                                return False, conflicts_resolved
+                        else:
+                            # Some other error
+                            logging.debug(f"Rebase continue failed: {result.stderr[:200]}")
+                            # Don't loop infinitely on unknown errors
+                            if iteration > 50 and result.returncode != 0:
+                                logging.error(f"Repeated rebase errors - aborting after {iteration} iterations")
+                                logging.error(f"Last error: {result.stderr}")
+                                return False, conflicts_resolved
+                else:
+                    break
+            else:
+                # Continue rebase after resolving conflicts
+                result = subprocess.run(['git', '-c', 'core.editor=true', 'rebase', '--continue'],
+                                      capture_output=True, text=True, env=env)
+                if result.returncode != 0:
+                    if 'nothing to commit' in result.stderr:
+                        # Empty commit after conflict resolution, skip it
+                        logging.debug("Skipping empty commit after conflict resolution")
+                        subprocess.run(['git', '-c', 'core.editor=true', 'rebase', '--skip'],
+                                     check=True, env=env)
+                    elif 'You must edit all merge conflicts' in result.stderr or 'fix conflicts' in result.stderr.lower():
+                        # We resolved conflicts but git says there are still conflicts
+                        logging.warning(f"Conflicts remain after resolution attempt at iteration {iteration}")
+                        logging.warning(f"stderr: {result.stderr[:500]}")
+                        # Check for infinite loop
+                        if iteration > 50:
+                            logging.error("Stuck in conflict resolution loop")
+                            return False, conflicts_resolved
+                    else:
+                        logging.debug(f"Rebase continue failed after conflict resolution: {result.stderr[:200]}")
+                        # Don't loop infinitely
+                        if iteration > 50:
+                            logging.error(f"Repeated errors after conflict resolution - aborting")
+                            logging.error(f"Last error: {result.stderr}")
+                            return False, conflicts_resolved
+                    # Otherwise, we'll loop again to handle next conflict
+
+        if iteration >= max_iterations:
+            logging.error(f"Rebase failed - exceeded maximum iterations ({max_iterations})")
+            return False, conflicts_resolved
+
+        logging.info(f"Rebase completed with {len(conflicts_resolved)} auto-resolved conflicts")
+        return True, conflicts_resolved
+
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error during rebase: {e}")
+        # Try to abort the rebase
+        try:
+            subprocess.run(['git', 'rebase', '--abort'], check=True)
+        except:
+            pass
+        return False, conflicts_resolved
+    finally:
+        os.chdir(original_dir)
+
+
+def verify_release_changes(repo_path: str, source_ref: str, release_ref: str,
+                          expected_patterns: List[str]) -> Tuple[bool, Optional[str]]:
+    """
+    Verify that only expected files changed between source and release branches.
+
+    Args:
+        repo_path: Path to the repository
+        source_ref: Reference to compare from (e.g., original develop HEAD)
+        release_ref: Reference to compare to (e.g., current HEAD after rebase)
+        expected_patterns: List of file patterns that are expected to change
+
+    Returns:
+        Tuple of (is_valid: bool, diff_info: str or None)
+    """
+    original_dir = os.getcwd()
+
+    try:
+        os.chdir(repo_path)
+
+        # Get diff between source and release
+        result = subprocess.run([
+            'git', 'diff', '--name-only', source_ref, release_ref
+        ], capture_output=True, text=True, check=True)
+
+        if not result.stdout.strip():
+            # No differences - this is fine, especially for repos without submodules
+            logging.info("No differences between source and release branches - all changes were from rebase only")
+            return True, None
+
+        changed_files = result.stdout.strip().split('\n')
+        unexpected_files = []
+
+        for file in changed_files:
+            is_expected = False
+
+            # Check if file matches any expected pattern
+            for pattern in expected_patterns:
+                if file == pattern or file.endswith(pattern):
+                    is_expected = True
+                    break
+
+            # Check if it's a submodule by checking .gitmodules
+            if not is_expected:
+                try:
+                    result = subprocess.run([
+                        'git', 'config', '--file', '.gitmodules', '--get-regexp', 'path'
+                    ], capture_output=True, text=True)
+
+                    if result.stdout:
+                        for line in result.stdout.strip().split('\n'):
+                            if file in line:
+                                is_expected = True
+                                break
+                except:
+                    pass
+
+            if not is_expected:
+                unexpected_files.append(file)
+
+        if unexpected_files:
+            # Get the actual diffs for unexpected files
+            result = subprocess.run([
+                'git', 'diff', source_ref, release_ref, '--'
+            ] + unexpected_files, capture_output=True, text=True, check=True)
+
+            full_diff = result.stdout
+
+            # If diff is small, return it directly; otherwise save to file
+            if len(full_diff) < 1000:
+                return False, f"Unexpected files changed:\n{', '.join(unexpected_files)}\n\nDiff:\n{full_diff}"
+            else:
+                # Write to file
+                repo_name = os.path.basename(repo_path)
+                diff_file = f'/tmp/unexpected_diffs_{repo_name}.diff'
+                with open(diff_file, 'w') as f:
+                    f.write(f"Unexpected files changed: {', '.join(unexpected_files)}\n\n")
+                    f.write(full_diff)
+                return False, f"Unexpected files changed: {', '.join(unexpected_files)}\nLarge diff saved to: {diff_file}"
+
+        logging.info(f"Sanity check passed - {len(changed_files)} files changed, all expected")
+        return True, None
+
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error during sanity check: {e}")
+        return False, f"Error running sanity check: {e}"
+    finally:
+        os.chdir(original_dir)
+
 def load_config(config_path):
     """Load the YAML configuration file."""
     if not os.path.exists(config_path):
@@ -234,13 +701,26 @@ def validate_config(config):
                     sys.exit(1)
     logging.info("Configuration validation passed.")
 
+def normalize_gitlab_url(url):
+    """
+    Normalize GitLab URLs to consistent git@ SSH format.
+
+    Ensures HTTPS and SSH URLs pointing to the same repository are recognized
+    as identical for dependency matching.
+    """
+    if url.startswith('https://gitlab.syncad.com/'):
+        url = url.replace('https://gitlab.syncad.com/', 'git@gitlab.syncad.com:')
+    elif url.startswith('http://gitlab.syncad.com/'):
+        url = url.replace('http://gitlab.syncad.com/', 'git@gitlab.syncad.com:')
+    return url
+
 def resolve_submodule_url(parent_repo_url, submodule_url):
     """Resolve a submodule URL relative to the parent repo URL if necessary."""
     # If the submodule URL is already absolute (starts with git@, http, ssh, etc.),
-    # we assume it's a full URL.
+    # normalize it to the canonical SSH form for consistent dependency matching.
     if submodule_url.startswith('git@') or submodule_url.startswith('http://') \
        or submodule_url.startswith('https://') or submodule_url.startswith('ssh://'):
-        return submodule_url
+        return normalize_gitlab_url(submodule_url)
 
     # Split the parent URL into host part and path part.
     # Example:
@@ -864,7 +1344,7 @@ def create_branch_name(repo_url, tag=None, counter=None):
         base_name += f"-{counter}"
     return base_name
 
-def create_merge_request(repo, source_branch, target_branch, automerge=False):
+def create_merge_request(repo, source_branch, target_branch, automerge=False, mr_title=None):
     """Create a merge request using GitLab push options."""
     # GitLab specific push options
     push_options = [
@@ -874,9 +1354,13 @@ def create_merge_request(repo, source_branch, target_branch, automerge=False):
     ]
     if automerge:
         push_options.append('merge_request.merge_when_pipeline_succeeds=true')
+    if mr_title:
+        push_options.append(f'merge_request.title={mr_title}')
     return push_options
 
-def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabled=False, updated_repos_branches=None, updated_repos_commits=None):
+def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabled=False,
+                updated_repos_branches=None, updated_repos_commits=None,
+                release_to_master=False, force=False):
     """
     Update a single repository and its submodules.
 
@@ -891,6 +1375,8 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
                                                  Defaults to None.
         updated_repos_commits (dict, optional): A mapping of repository URLs to their commit hashes.
                                                 Used for auto-detecting CI include updates.
+        release_to_master (bool, optional): Run the release-to-master workflow (rebase source onto target). Defaults to False.
+        force (bool, optional): Skip release-mode sanity-check prompts. Defaults to False.
 
     Returns:
         RepoOperationResult: The result of the operation.
@@ -923,14 +1409,207 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
     # Initialize updated_yaml_files to ensure it's always defined
     updated_yaml_files = {}
 
-    # Determine the desired reference to checkout
-    desired_ref_actual = get_desired_ref(repo, repo_url, ref_from_dir, desired_ref)
+    # Track source HEAD across the function for the release-mode sanity check
+    source_head = None
 
-    # Fetch updates from the remote repository
-    fetch_updates(repo, repo_url)
+    if release_to_master:
+        # ----- Release-to-master workflow: rebase source ref onto target branch -----
+        source_ref = settings.get('source_ref', 'develop')
+        target_branch = desired_ref  # expected to be 'master' or 'main'
 
-    # Checkout the desired reference
-    checkout_reference(repo, repo_url, desired_ref_actual)
+        if target_branch not in ['master', 'main']:
+            logging.error(f"For --release-to-master, repo {repo_url} must have ref: master or main, got: {target_branch}")
+            result.success = False
+            result.error_message = f"Invalid target branch for release: {target_branch}"
+            return result
+
+        # Fetch updates first so we have origin refs available
+        fetch_updates(repo, repo_url)
+
+        # Resolve source_ref: prefer local branch, fall back to origin/<branch>
+        if not source_ref.startswith('origin/') and '/' not in source_ref:
+            try:
+                subprocess.run(['git', 'rev-parse', '--verify', source_ref],
+                               cwd=clone_path, capture_output=True, text=True, check=True)
+            except subprocess.CalledProcessError:
+                try:
+                    subprocess.run(['git', 'rev-parse', '--verify', f'origin/{source_ref}'],
+                                   cwd=clone_path, capture_output=True, text=True, check=True)
+                    source_ref = f'origin/{source_ref}'
+                    logging.debug(f"Using remote reference: {source_ref}")
+                except subprocess.CalledProcessError:
+                    logging.error(f"Neither {source_ref} nor origin/{source_ref} exists")
+                    result.success = False
+                    result.error_message = f"Source reference {source_ref} not found"
+                    return result
+
+        logging.info(f"Release workflow: {source_ref} -> {target_branch}")
+
+        # Find a sensible rebase base by patch-id matching, falling back to merge-base
+        logging.info(f"Finding rebase base for {repo_url}...")
+        rebase_base = find_rebase_base(clone_path, source_ref, f'origin/{target_branch}')
+
+        if not rebase_base:
+            logging.warning("Could not find rebase base using patch-id, using merge-base")
+            try:
+                result_cmd = subprocess.run(
+                    ['git', 'merge-base', f'origin/{target_branch}', source_ref],
+                    cwd=clone_path, capture_output=True, text=True, check=True
+                )
+                rebase_base = result_cmd.stdout.strip()
+            except subprocess.CalledProcessError:
+                result.success = False
+                result.error_message = "Failed to find rebase base"
+                return result
+
+        # Detect fast-forward case: target HEAD is already on source ref
+        is_fast_forward = False
+        try:
+            target_head_result = subprocess.run(
+                ['git', 'rev-parse', f'origin/{target_branch}'],
+                cwd=clone_path, capture_output=True, text=True, check=True
+            )
+            target_head = target_head_result.stdout.strip()
+            ancestor_check = subprocess.run(
+                ['git', 'merge-base', '--is-ancestor', target_head, source_ref],
+                cwd=clone_path, capture_output=True, text=True
+            )
+            if ancestor_check.returncode == 0:
+                logging.info(f"Target {target_branch} HEAD ({target_head[:8]}) is already on {source_ref} - fast-forward")
+                is_fast_forward = True
+                rebase_base = target_head
+        except subprocess.CalledProcessError as e:
+            logging.debug(f"Error checking for fast-forward: {e}")
+
+        # Count commits to apply
+        try:
+            result_cmd = subprocess.run(
+                ['git', 'rev-list', '--count', f'{rebase_base}..{source_ref}'],
+                cwd=clone_path, capture_output=True, text=True, check=True
+            )
+            commit_count = int(result_cmd.stdout.strip())
+            verb = "fast-forward" if is_fast_forward else "rebase"
+            logging.info(f"Will {verb} {commit_count} commits from {rebase_base[:8]}")
+        except Exception:
+            commit_count = 0
+
+        # 0 commits to rebase: defer release-branch creation; checkout target so we
+        # can still pick up submodule updates if any.
+        if commit_count == 0:
+            logging.info(f"No commits to rebase for {repo_url} - source and target already aligned")
+            result.rebase_performed = False
+
+            try:
+                subprocess.run(
+                    ['git', 'checkout', '-B', target_branch,
+                     '--track', f'origin/{target_branch}', '--no-recurse-submodules'],
+                    cwd=clone_path, check=True, capture_output=True, text=True
+                )
+                release_branch = f'release/{tag}' if tag else f'release-{target_branch}-{get_repo_name(repo_url)}'
+                result.branch_name = None  # set later if a release branch is needed
+                desired_ref_actual = target_branch
+                settings['pending_release_branch'] = release_branch
+                repo = Repo(clone_path)
+            except subprocess.CalledProcessError as e:
+                logging.error(f"Failed to checkout target branch: {e}")
+                result.success = False
+                result.error_message = str(e)
+                return result
+        else:
+            # Capture source HEAD before we move things around (used by sanity check)
+            try:
+                result_cmd = subprocess.run(
+                    ['git', 'rev-parse', source_ref],
+                    cwd=clone_path, capture_output=True, text=True, check=True
+                )
+                source_head = result_cmd.stdout.strip()
+            except Exception:
+                source_head = source_ref
+
+            release_branch = f'release/{tag}' if tag else f'release-{target_branch}-{get_repo_name(repo_url)}'
+
+            # Clean any previous local copy of the target branch then create a release
+            # branch from source so we can rebase it onto target.
+            try:
+                subprocess.run(['git', 'branch', '-D', target_branch],
+                               cwd=clone_path, capture_output=True, text=True)
+            except Exception:
+                pass
+
+            try:
+                subprocess.run(['git', 'reset', '--hard'], cwd=clone_path, capture_output=True, text=True)
+                subprocess.run(['git', 'checkout', source_ref],
+                               cwd=clone_path, check=True, capture_output=True, text=True)
+                subprocess.run(['git', 'checkout', '-b', release_branch],
+                               cwd=clone_path, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as e:
+                logging.error(f"Failed to create release branch: {e}")
+                result.success = False
+                result.error_message = str(e)
+                return result
+
+            if is_fast_forward:
+                logging.info(f"Performing fast-forward merge from {source_ref}...")
+                try:
+                    subprocess.run(['git', 'merge', '--ff-only', source_ref],
+                                   cwd=clone_path, capture_output=True, text=True, check=True)
+                    logging.info("Fast-forward merge completed successfully")
+                    success = True
+                    conflicts = []
+                except subprocess.CalledProcessError as e:
+                    logging.error(f"Fast-forward merge failed: {e}")
+                    result.success = False
+                    result.error_message = "Fast-forward merge failed"
+                    return result
+            else:
+                success, conflicts = perform_release_rebase(
+                    clone_path, rebase_base, source_ref, f'origin/{target_branch}', commit_count
+                )
+
+            if not success:
+                result.success = False
+                result.error_message = "Rebase or merge failed"
+                return result
+
+            result.branch_name = release_branch
+            updated_repos_branches[repo_url] = release_branch
+            logging.debug(f"Recorded release branch '{release_branch}' for '{repo_url}'")
+
+            if is_fast_forward:
+                result.rebase_performed = False
+                result.conflicts_resolved = []
+            else:
+                result.rebase_performed = True
+                result.conflicts_resolved = conflicts
+                if conflicts:
+                    logging.info(f"Auto-resolved {len(conflicts)} conflicts:")
+                    for c in conflicts[:5]:
+                        logging.info(f"  - {c}")
+                    if len(conflicts) > 5:
+                        logging.info(f"  ... and {len(conflicts)-5} more")
+
+                # After rebase we are detached; move release branch to new HEAD and check it out.
+                try:
+                    head_commit = subprocess.run(['git', 'rev-parse', 'HEAD'],
+                                                 cwd=clone_path, capture_output=True, text=True, check=True).stdout.strip()
+                    subprocess.run(['git', 'branch', '-f', release_branch, head_commit],
+                                   cwd=clone_path, check=True, capture_output=True)
+                    subprocess.run(['git', 'checkout', release_branch],
+                                   cwd=clone_path, check=True, capture_output=True)
+                except subprocess.CalledProcessError as e:
+                    logging.error(f"Failed to update release branch after rebase: {e}")
+                    result.success = False
+                    result.error_message = str(e)
+                    return result
+
+            repo = Repo(clone_path)
+            result.repo_object = repo
+            desired_ref_actual = release_branch
+    else:
+        # ----- Normal develop-branch workflow -----
+        desired_ref_actual = get_desired_ref(repo, repo_url, ref_from_dir, desired_ref)
+        fetch_updates(repo, repo_url)
+        checkout_reference(repo, repo_url, desired_ref_actual)
 
     # Record this repo's commit hash for CI include updates in downstream repos
     current_commit = repo.head.commit.hexsha
@@ -943,6 +1622,13 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
     # Identify submodule updates
     updated_submodules, submodule_commits = identify_submodule_updates(repo, config, updated_repos_branches)
     result.submodules_updated = updated_submodules
+
+    # Release mode: warn if rebase happened but no submodule updates were detected.
+    if release_to_master and result.rebase_performed and not updated_submodules:
+        if len(list(repo.submodules)) > 0:
+            logging.warning("Release workflow completed rebase but found no submodule updates")
+            logging.warning("This may be normal if submodules were already at correct commits")
+            logging.warning("(sanity check below will catch real issues)")
 
     # Auto-detect CI include updates (regardless of submodule updates)
     auto_detected_yaml_updates = collect_auto_detected_yaml_updates(clone_path, config, updated_repos_commits)
@@ -958,9 +1644,26 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
     has_any_updates = has_submodule_updates or has_ci_include_updates or has_manual_yaml_updates
 
     if has_any_updates:
-        # Create a feature branch for the updates (always create in Phase 1)
-        branch_name = create_feature_branch(repo, repo_url, tag, push_enabled=False)
-        result.branch_name = branch_name
+        # In release mode we may already have a release branch from the rebase; reuse it.
+        if release_to_master and result.branch_name:
+            branch_name = result.branch_name
+            logging.debug(f"Using existing release branch '{branch_name}' from rebase workflow")
+        elif release_to_master and 'pending_release_branch' in settings:
+            # 0-commit release path that now needs a branch for submodule/yaml updates.
+            release_branch = settings['pending_release_branch']
+            try:
+                subprocess.run(['git', 'checkout', '-b', release_branch],
+                               cwd=clone_path, check=True, capture_output=True, text=True)
+                branch_name = release_branch
+                result.branch_name = branch_name
+                logging.info(f"Created release branch '{branch_name}' for submodule/YAML updates")
+            except subprocess.CalledProcessError as e:
+                logging.error(f"Failed to create release branch: {e}")
+                branch_name = None
+        else:
+            # Normal flow: new feature branch
+            branch_name = create_feature_branch(repo, repo_url, tag, push_enabled=False)
+            result.branch_name = branch_name
 
         if branch_name:
             # Merge manual and auto-detected YAML updates
@@ -977,9 +1680,10 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
             # Commit the changes
             commit_changes_extended(repo, repo_url, updated_submodules, updated_yaml_files)
 
-            # Record the branch to update parent repositories
-            updated_repos_branches[repo_url] = branch_name
-            logging.debug(f"Recorded updated branch '{branch_name}' for repository '{repo_url}'")
+            # Record the branch to update parent repositories (skip if already set in release mode)
+            if repo_url not in updated_repos_branches:
+                updated_repos_branches[repo_url] = branch_name
+                logging.debug(f"Recorded updated branch '{branch_name}' for repository '{repo_url}'")
 
             # Update this repo's commit to the new commit after changes
             updated_repos_commits[repo_url] = repo.head.commit.hexsha
@@ -987,14 +1691,17 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
 
             # Only push if in Phase 2
             if push_enabled:
-                push_branch(repo, repo_url, branch_name, settings, automerge, create_mr, dry_run=False)
+                push_branch(repo, repo_url, branch_name, settings, automerge, create_mr, dry_run=False,
+                            release_to_master=release_to_master, tag=tag)
             else:
                 logging.info(f"Phase 1: Created branch '{branch_name}' locally, not pushing yet")
 
     # Handle tagging
     if tag:
+        # Treat a rebase as "changes" so an existing tag at the old commit is not silently kept.
+        changes_made = has_any_updates or result.rebase_performed
         # Always create tag locally in Phase 1 (to catch conflicts early)
-        create_tag_locally(repo, repo_url, tag, retag)
+        create_tag_locally(repo, repo_url, tag, retag, changes_made)
         result.tag_to_create = tag
 
         if push_enabled:
@@ -1005,6 +1712,56 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
 
     # Log a summary of the commits
     log_commit_summary(repo_url, updated_submodules, updated_yaml_files, push_enabled)
+
+    # Release-mode sanity check: verify only expected files (submodules / configured YAML) changed.
+    if release_to_master and source_head:
+        logging.info("Performing sanity check...")
+
+        expected_patterns = ['.gitmodules']
+
+        # Submodule paths from .gitmodules
+        try:
+            result_cmd = subprocess.run(
+                ['git', 'config', '--file', '.gitmodules', '--get-regexp', 'path'],
+                cwd=clone_path, capture_output=True, text=True
+            )
+            if result_cmd.stdout:
+                for line in result_cmd.stdout.strip().split('\n'):
+                    parts = line.split()
+                    if parts:
+                        expected_patterns.append(parts[-1])
+        except Exception:
+            pass
+
+        # YAML files from config
+        for yaml_update in settings.get('update_yaml', []) or []:
+            filename = yaml_update.get('filename')
+            if filename:
+                expected_patterns.append(filename)
+
+        is_valid, diff_info = verify_release_changes(
+            clone_path, source_head, 'HEAD', expected_patterns
+        )
+        result.sanity_check_passed = is_valid
+
+        if not is_valid:
+            logging.warning(f"Sanity check failed for {repo_url}")
+            if diff_info:
+                if len(diff_info) < 1000:
+                    logging.warning(diff_info)
+                else:
+                    logging.warning(diff_info.split('\n')[0] if diff_info else diff_info)
+
+            if not force:
+                response = input(f"\nUnexpected changes detected in {get_repo_name(repo_url)}. Continue? (y/n): ")
+                if response.lower() != 'y':
+                    result.success = False
+                    result.error_message = "Aborted due to unexpected changes"
+                    return result
+            else:
+                logging.warning("Continuing due to --force flag")
+        else:
+            logging.info("Sanity check passed")
 
     return result
 
@@ -1295,12 +2052,18 @@ def commit_changes_extended(repo, repo_url, updated_submodules, updated_yaml_fil
 
     try:
         repo.index.commit(commit_message)
-        logging.debug(f"Committed changes in '{get_repo_name(repo_url)}' on branch '{repo.active_branch}'.")
+        try:
+            branch_label = repo.active_branch.name
+            logging.debug(f"Committed changes in '{get_repo_name(repo_url)}' on branch '{branch_label}'.")
+        except TypeError:
+            # active_branch raises TypeError when HEAD is detached
+            logging.debug(f"Committed changes in '{get_repo_name(repo_url)}' (detached HEAD).")
     except GitCommandError as e:
         logging.error(f"Failed to commit changes in '{get_repo_name(repo_url)}': {e}")
         sys.exit(1)
 
-def push_branch(repo, repo_url, branch_name, settings, automerge, create_mr, dry_run):
+def push_branch(repo, repo_url, branch_name, settings, automerge, create_mr, dry_run,
+                release_to_master=False, tag=None):
     """Push the feature branch to the remote repository and create a merge request if applicable."""
     if dry_run:
         logging.info("Dry run enabled. Push actions skipped.")
@@ -1310,11 +2073,23 @@ def push_branch(repo, repo_url, branch_name, settings, automerge, create_mr, dry
         if create_mr:
             # Determine the target branch: use 'target_branch' if specified, else default to 'ref', else 'main'
             target_branch = settings.get('target_branch', settings.get('ref', 'main'))
-            push_options = create_merge_request(repo, branch_name, target_branch, automerge=automerge)
+
+            # Generate an MR title that reflects what this push is for
+            if release_to_master and tag:
+                mr_title = f"Release {tag}"
+            elif release_to_master:
+                mr_title = f"Merge changes to {target_branch}"
+            elif tag:
+                mr_title = f"Update submodules for {tag}"
+            else:
+                mr_title = "Update submodules"
+
+            push_options = create_merge_request(repo, branch_name, target_branch,
+                                                automerge=automerge, mr_title=mr_title)
             logging.debug(f"Pushing branch '{branch_name}' with push options: {push_options}")
             # Pass push_options as a single string within a list
             repo.remotes.origin.push(refspec=f"{branch_name}:{branch_name}", push_option=push_options, recurse_submodules='no')
-            logging.info(f"Pushed branch '{branch_name}' to '{repo_url}' with push options for merge request targeting '{target_branch}'.")
+            logging.info(f"Pushed branch '{branch_name}' to '{repo_url}' with MR title '{mr_title}' targeting '{target_branch}'.")
         else:
             repo.remotes.origin.push(refspec=f"{branch_name}:{branch_name}", recurse_submodules='no')
             logging.info(f"Pushed branch '{branch_name}' to '{repo_url}'.")
@@ -1420,8 +2195,12 @@ def process_yaml_updates(clone_path, updated_yaml_files, submodule_commits):
             logging.error(f"Failed to stage YAML file '{filename}': {e}")
             continue
 
-def create_tag_locally(repo, repo_url, tag, retag):
-    """Create a tag locally (Phase 1 operation)."""
+def create_tag_locally(repo, repo_url, tag, retag, changes_made=True):
+    """Create a tag locally (Phase 1 operation).
+
+    If the tag already exists and no changes were made (no submodule updates and no
+    release-mode rebase), the existing tag is already correct — leave it in place.
+    """
     if not tag:
         return
 
@@ -1436,8 +2215,11 @@ def create_tag_locally(repo, repo_url, tag, retag):
                 logging.debug(f"Deleted local tag '{tag}'")
             except GitCommandError as e:
                 logging.warning(f"Could not delete local tag '{tag}': {e}")
+        elif not changes_made:
+            logging.info(f"Tag '{tag}' already exists in '{get_repo_name(repo_url)}' and no changes were made — leaving tag in place.")
+            return
         else:
-            logging.error(f"Tag '{tag}' already exists in '{repo_url}'. Use '--retag' to overwrite.")
+            logging.error(f"Tag '{tag}' already exists in '{repo_url}' but changes were made. Use '--retag' to overwrite.")
             sys.exit(1)
 
     # Create the tag locally
@@ -1849,7 +2631,8 @@ def push_tags_in_waves(operations, dependency_graph, sorted_repos):
                     verify_tag_exists(repo_url, tag)
 
 
-def push_all_operations(operations, dependency_graph, sorted_repos):
+def push_all_operations(operations, dependency_graph, sorted_repos,
+                        no_push_tags=False, release_to_master=False, tag=None):
     """Phase 2: Push all operations to remote in topological order."""
     logging.info("=" * 60)
     logging.info("PHASE 2: Pushing all changes to remote repositories")
@@ -1857,8 +2640,13 @@ def push_all_operations(operations, dependency_graph, sorted_repos):
 
     push_failures = []
 
-    # Push tags first in dependency waves (ensures submodule commits are indexed)
-    push_tags_in_waves(operations, dependency_graph, sorted_repos)
+    # Push tags first in dependency waves (ensures submodule commits are indexed
+    # before downstream CI runs).  --no-push-tags skips the tag push entirely (e.g.
+    # for release-validation runs where the tag is created locally only).
+    if not no_push_tags:
+        push_tags_in_waves(operations, dependency_graph, sorted_repos)
+    else:
+        logging.info("Skipping tag push (--no-push-tags specified)")
 
     # Then push branches and create MRs (in topological order)
     for repo_url in sorted_repos:
@@ -1882,7 +2670,8 @@ def push_all_operations(operations, dependency_graph, sorted_repos):
             # Push the branch and create MR
             automerge = settings.get('automerge', False)
             create_mr = settings.get('create_merge_request', True)
-            push_branch(repo, repo_url, operation.branch_name, settings, automerge, create_mr, dry_run=False)
+            push_branch(repo, repo_url, operation.branch_name, settings, automerge, create_mr, dry_run=False,
+                        release_to_master=release_to_master, tag=tag)
 
         except Exception as e:
             logging.error(f"Failed to push changes for '{repo_url}': {e}")
@@ -1901,9 +2690,19 @@ def main():
     args = parse_arguments()
     setup_logging(args.log_level)
     logging.debug("Starting the repository update process.")
-    
+
+    # Resolve the config path: explicit --config wins, otherwise default to
+    # repos.yaml.master in release-to-master mode and repos.yaml otherwise.
+    if args.config:
+        config_path = args.config
+    elif args.release_to_master:
+        config_path = 'repos.yaml.master'
+    else:
+        config_path = CONFIG_FILE
+    logging.info(f"Using configuration file: {config_path}")
+
     # Load and validate configuration
-    config = load_config(CONFIG_FILE)
+    config = load_config(config_path)
     validate_config(config)
     
     # Handle cleanup mode
@@ -1966,7 +2765,9 @@ def main():
             retag=retag,
             push_enabled=False,  # Phase 1: local only
             updated_repos_branches=updated_repos_branches,
-            updated_repos_commits=updated_repos_commits
+            updated_repos_commits=updated_repos_commits,
+            release_to_master=args.release_to_master,
+            force=args.force,
         )
         
         operations[repo_url] = result
@@ -2030,7 +2831,10 @@ def main():
     # ========================================================================
     # PHASE 2: Push to Remote (in topological order)
     # ========================================================================
-    success = push_all_operations(operations, dependency_graph, sorted_repos)
+    success = push_all_operations(operations, dependency_graph, sorted_repos,
+                                  no_push_tags=args.no_push_tags,
+                                  release_to_master=args.release_to_master,
+                                  tag=args.tag)
     
     if success:
         logging.info("=" * 60)

@@ -14,15 +14,15 @@ This repository contains Python scripts for automating Git submodule updates acr
 
 | Script | Purpose |
 |--------|---------|
-| `update-submodules.py` | Main script for updating submodule references across repos (develop branch workflow) |
-| `update-submodules-release.py` | Extended version with `--release-to-master` for rebasing develop onto master |
+| `update-submodules.py` | Unified script: develop-branch tagging by default, or `--release-to-master` to rebase develop onto master |
 | `checkout_develop_versions.py` | Utility to checkout develop branch in all repos in a directory |
 | `revert_update_submodules.py` | Cleanup script to delete `update-submodules-*` branches and tags |
 
 ## Configuration Files
 
-- `repos.yaml` - Config for develop branch workflow
-- `repos.yaml.to-master` - Config for master branch releases (uses `source_ref` for specific commits)
+- `repos.yaml` - Default config (develop-branch tagging workflow)
+- `repos.yaml.master` - Default config when `--release-to-master` is set (master-branch release workflow; uses `source_ref` to pin specific develop commits when needed)
+- `--config <path>` overrides either default
 - `config.ini` - GitLab API credentials (optional, can use `GITLAB_TOKEN` env var instead)
 
 ### repos.yaml Structure
