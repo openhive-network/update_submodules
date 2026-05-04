@@ -53,13 +53,15 @@ git@gitlab.syncad.com:hive/hivemind.git:
   ref: 'develop'
   automerge: true
   update_yaml:
-    # hivemind's CI file uses the .yaml extension, not .yml.
+    # develop renamed .gitlab-ci.yaml -> .gitlab-ci.yml in commit c409f8cff;
+    # master still has .yaml.  This config matches the develop side because
+    # that's the final state of both develop-tag and release-to-master flows.
     # For tagged builds: clean up stale HAF branch overrides and set UPSTREAM_BRANCH to tag.
-  - filename: .gitlab-ci.yaml
+  - filename: .gitlab-ci.yml
     key_to_update: find_haf_image.variables.HAF_PATTERNS_REF
     action: remove
     when: tag
-  - filename: .gitlab-ci.yaml
+  - filename: .gitlab-ci.yml
     key_to_update: find_haf_image.variables.UPSTREAM_BRANCH
     value: $TAG
     when: tag
