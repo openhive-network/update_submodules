@@ -72,12 +72,13 @@ git@gitlab.syncad.com:hive/hivemind.git:
   ref: 'master'
   automerge: true
   update_yaml:
-    # For tagged builds: clean up stale HAF branch overrides and set UPSTREAM_BRANCH to tag
-    - filename: '.gitlab-ci.yml'
+    # hivemind's CI file uses the .yaml extension, not .yml.
+    # For tagged builds: clean up stale HAF branch overrides and set UPSTREAM_BRANCH to tag.
+    - filename: '.gitlab-ci.yaml'
       key_to_update: 'find_haf_image.variables.HAF_PATTERNS_REF'
       action: 'remove'
       when: 'tag'
-    - filename: '.gitlab-ci.yml'
+    - filename: '.gitlab-ci.yaml'
       key_to_update: 'find_haf_image.variables.UPSTREAM_BRANCH'
       value: '$TAG'
       when: 'tag'
