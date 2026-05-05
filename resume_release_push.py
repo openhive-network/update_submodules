@@ -88,8 +88,22 @@ def reconstruct_operations(us, config, sorted_repos, tag, skip_repos):
         local_tags = [t.name for t in repo.tags]
         if tag in local_tags:
             result.tag_to_create = tag
+        elif result.branch_name:
+            # Local tag missing but the release branch is here — recreate the tag
+            # at the branch tip so the push goes through.  This is the same commit
+            # Phase 1's create_tag_locally would have used.
+            tip = repo.heads[result.branch_name].commit
+            logging.warning(
+                f"'{repo_name}' has no local '{tag}' tag — "
+                f"creating it at release branch tip {tip.hexsha[:8]}"
+            )
+            try:
+                repo.create_tag(tag, ref=tip, message=f"Release {tag}")
+                result.tag_to_create = tag
+            except Exception as e:
+                logging.error(f"'{repo_name}': could not create tag '{tag}' at {tip.hexsha[:8]}: {e}")
         else:
-            logging.warning(f"'{repo_name}' has no local '{tag}' tag")
+            logging.warning(f"'{repo_name}' has no local '{tag}' tag and no release branch — skipping tag")
 
         if not result.branch_name and not result.tag_to_create:
             logging.warning(f"'{repo_name}' has neither branch nor tag — nothing to push, skipping")
