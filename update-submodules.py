@@ -2288,8 +2288,19 @@ def push_tag(repo, repo_url, tag):
         _check_push_result(result, repo_url, tag)
         logging.info(f"Pushed tag '{tag}' to '{repo_url}'.")
     except GitCommandError as e:
-        # If push fails, it might be because the tag already exists on remote
-        if "already exists" in str(e) or "cannot lock ref" in str(e) or "rejected" in str(e).lower():
+        # The delete-and-repush dance only makes sense if the rejection is genuinely
+        # because the tag already exists on the remote.  Other rejection causes
+        # (server-side hooks blocking commit content, branch protection, network
+        # errors, ...) shouldn't be silently routed into this path — they'd waste
+        # a delete attempt and obscure the real cause.  We test for messages that
+        # specifically indicate "tag already there" rather than any "rejected".
+        err_text = str(e)
+        looks_like_existing_tag = (
+            "already exists" in err_text
+            or "cannot lock ref" in err_text
+            or "stale info" in err_text
+        )
+        if looks_like_existing_tag:
             logging.info(f"Tag '{tag}' already exists on remote, attempting to delete and repush...")
 
             # Try to delete remote tag via Git first
@@ -2318,7 +2329,15 @@ def push_tag(repo, repo_url, tag):
                     logging.error(f"Failed to delete protected tag '{tag}'. Please delete manually or provide GITLAB_TOKEN")
                     sys.exit(1)
         else:
-            logging.error(f"Failed to push tag '{tag}' to '{repo_url}': {e}")
+            # Surface the real server message so we can see policy hooks, branch
+            # protection, etc.  Most of the useful detail is in stderr.
+            logging.error(f"Failed to push tag '{tag}' to '{repo_url}': push was rejected.")
+            stderr = getattr(e, 'stderr', '') or ''
+            for line in stderr.splitlines():
+                if line.strip():
+                    logging.error(f"  remote: {line.rstrip()}")
+            if not stderr:
+                logging.error(f"  {err_text}")
             sys.exit(1)
 
 def handle_tagging(repo, repo_url, tag, retag, dry_run):
