@@ -22,6 +22,13 @@ git@gitlab.syncad.com:hive/haf.git:
 git@gitlab.syncad.com:hive/haf_api_node.git:
   ref: 'develop'
   automerge: true
+  # Point the operator template at the release being tagged, so a fresh
+  # haf_api_node checkout deploys this tag's images without a manual edit.
+  update_env:
+  - filename: .env.example
+    key: HIVE_API_NODE_VERSION
+    value: $TAG
+    when: tag
 
 # HAF applications
 # CI includes are auto-detected - no manual update_yaml needed
@@ -82,6 +89,23 @@ git@gitlab.syncad.com:hive/hivesense.git:
     value: $TAG
     when: tag
 git@gitlab.syncad.com:hive/nft_tracker.git:
+  ref: 'develop'
+  automerge: true
+# haf_stats: in haf_api_node since !244 (own `haf-stats` profile). Its CI builds
+# on tag pipelines and mirrors the tagged images (publish_tag / publish_images),
+# so a release tag here is what makes ${HIVE_API_NODE_VERSION} resolve for it.
+git@gitlab.syncad.com:hive/haf_stats.git:
+  ref: 'develop'
+  automerge: true
+  update_yaml:
+  - filename: .gitlab-ci.yml
+    key_to_update: find_haf_image.variables.UPSTREAM_BRANCH
+    value: $TAG
+    when: tag
+# haf_fyp: tagged alongside the stack. NOTE its CI publishes images only from
+# the default branch (SHA and `develop` tags); a tag pipeline builds nothing, so
+# until haf_fyp gains tag publishing the release tag is a git tag only.
+git@gitlab.syncad.com:hive/haf_fyp.git:
   ref: 'develop'
   automerge: true
 

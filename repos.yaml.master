@@ -36,6 +36,12 @@ git@gitlab.syncad.com:hive/haf.git:
 git@gitlab.syncad.com:hive/haf_api_node.git:
   ref: 'master'
   automerge: true
+  # Point the operator template at the release being tagged (see repos.yaml).
+  update_env:
+    - filename: '.env.example'
+      key: 'HIVE_API_NODE_VERSION'
+      value: '$TAG'
+      when: 'tag'
 
 # HAF applications
 # CI includes between these and haf are auto-detected from .gitlab-ci.yml.

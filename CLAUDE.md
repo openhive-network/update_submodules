@@ -38,6 +38,11 @@ git@gitlab.syncad.com:hive/repo.git:
     - filename: '.gitlab-ci.yml'
       key_to_update: 'include[project=hive/haf].ref'
       submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
+  update_env:              # dotenv-style KEY=value edits ($TAG = the tag being created)
+    - filename: '.env.example'
+      key: 'HIVE_API_NODE_VERSION'
+      value: '$TAG'
+      when: tag
 ```
 
 ## Common Commands

@@ -207,6 +207,28 @@ repository_url:
   submodule_referenced: ssh://steem-8.syncad.com/home/syncad/repos/C
   ```
 
+### `update_env` Entries
+
+For dotenv-style files (`KEY=value` per line, such as haf_api_node's
+`.env.example`), `update_env` sets a key to a literal value. `$TAG` is replaced
+with the tag being created and `when: tag` skips the entry on untagged runs:
+
+```yaml
+git@gitlab.syncad.com:hive/haf_api_node.git:
+  ref: 'develop'
+  update_env:
+  - filename: .env.example
+    key: HIVE_API_NODE_VERSION
+    value: $TAG
+    when: tag
+```
+
+Only the first *uncommented* `KEY=` line is rewritten; comments, ordering and
+the rest of the file are preserved. A key with no uncommented assignment is an
+error (the key is never created, so it cannot land in the wrong section of a
+hand-maintained file). The edit is staged into the same commit as the
+submodule and YAML updates and listed under "Update environment defaults:".
+
 ### Complete Example
 
 ```yaml

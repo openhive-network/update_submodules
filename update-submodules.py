@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import re
 import sys
 import time
 import yaml
@@ -20,6 +21,7 @@ from git import Repo, GitCommandError, PushInfo
 # Configuration
 CONFIG_FILE = 'repos.yaml'
 BASE_DIR = 'repositories'  # Directory to clone repositories into
+ENV_KEY_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')  # dotenv variable names for update_env
 
 @dataclass
 class RepoOperationResult:
@@ -28,6 +30,7 @@ class RepoOperationResult:
     branch_name: Optional[str] = None
     submodules_updated: Dict = None
     yaml_files_updated: Dict = None
+    env_files_updated: Dict = None
     tag_to_create: Optional[str] = None
     success: bool = True
     error_message: Optional[str] = None
@@ -42,6 +45,8 @@ class RepoOperationResult:
             self.submodules_updated = {}
         if self.yaml_files_updated is None:
             self.yaml_files_updated = {}
+        if self.env_files_updated is None:
+            self.env_files_updated = {}
         if self.settings is None:
             self.settings = {}
         if self.conflicts_resolved is None:
@@ -701,6 +706,26 @@ def validate_config(config):
                     sys.exit(1)
                 if 'short_sha' in edit and not isinstance(edit['short_sha'], bool):
                     logging.error(f"'short_sha' must be a boolean in 'update_yaml' for repository '{repo_url}'.")
+                    sys.exit(1)
+        # Validate 'update_env' if present: KEY=value edits in dotenv-style files
+        update_env = settings.get('update_env')
+        if update_env:
+            if not isinstance(update_env, list):
+                logging.error(f"'update_env' for repository '{repo_url}' must be a list of update instructions.")
+                sys.exit(1)
+            for edit in update_env:
+                if not isinstance(edit, dict):
+                    logging.error(f"Each entry in 'update_env' for repository '{repo_url}' must be a dictionary.")
+                    sys.exit(1)
+                for field in ('filename', 'key', 'value'):
+                    if field not in edit or not isinstance(edit[field], str) or not edit[field].strip():
+                        logging.error(f"Each 'update_env' entry for repository '{repo_url}' must contain a non-empty '{field}'.")
+                        sys.exit(1)
+                if not ENV_KEY_RE.fullmatch(edit['key']):
+                    logging.error(f"Invalid 'key' '{edit['key']}' in 'update_env' for repository '{repo_url}' (expected a dotenv variable name).")
+                    sys.exit(1)
+                if 'when' in edit and edit['when'] != 'tag':
+                    logging.error(f"Invalid 'when' value '{edit['when']}' in 'update_env' for repository '{repo_url}'. Only 'tag' is supported.")
                     sys.exit(1)
     logging.info("Configuration validation passed.")
 
@@ -1676,11 +1701,15 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
     # that don't depend on submodule changes (e.g., value or action: remove entries)
     manual_yaml_updates = collect_yaml_updates(settings, updated_submodules, tag_name=tag, all_repo_commits=updated_repos_commits)
 
+    # Collect dotenv-style edits (e.g. haf_api_node's .env.example HIVE_API_NODE_VERSION)
+    env_updates = collect_env_updates(settings, tag_name=tag)
+
     # Determine if we have any updates to make
     has_submodule_updates = bool(updated_submodules)
     has_ci_include_updates = bool(auto_detected_yaml_updates)
     has_manual_yaml_updates = bool(manual_yaml_updates)
-    has_any_updates = has_submodule_updates or has_ci_include_updates or has_manual_yaml_updates
+    has_env_updates = bool(env_updates)
+    has_any_updates = has_submodule_updates or has_ci_include_updates or has_manual_yaml_updates or has_env_updates
 
     if has_any_updates:
         # In release mode we may already have a release branch from the rebase; reuse it.
@@ -1716,8 +1745,13 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
             if updated_yaml_files:
                 process_yaml_updates(clone_path, updated_yaml_files, all_commits)
 
+            # Process dotenv-style edits
+            if env_updates:
+                env_updates = process_env_updates(clone_path, env_updates)
+                result.env_files_updated = env_updates
+
             # Commit the changes
-            commit_changes_extended(repo, repo_url, updated_submodules, updated_yaml_files)
+            commit_changes_extended(repo, repo_url, updated_submodules, updated_yaml_files, env_updates)
 
             # Record the branch to update parent repositories (skip if already set in release mode)
             if repo_url not in updated_repos_branches:
@@ -1750,7 +1784,7 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
             logging.info(f"Phase 1: Tag '{tag}' created locally, will push in Phase 2")
 
     # Log a summary of the commits
-    log_commit_summary(repo_url, updated_submodules, updated_yaml_files, push_enabled)
+    log_commit_summary(repo_url, updated_submodules, updated_yaml_files, push_enabled, env_updates)
 
     # Release-mode sanity check: verify only expected files (submodules / configured YAML) changed.
     if release_to_master and source_head:
@@ -1772,9 +1806,9 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
         except Exception:
             pass
 
-        # YAML files from config
-        for yaml_update in settings.get('update_yaml', []) or []:
-            filename = yaml_update.get('filename')
+        # YAML and dotenv files from config
+        for file_update in (settings.get('update_yaml', []) or []) + (settings.get('update_env', []) or []):
+            filename = file_update.get('filename')
             if filename:
                 expected_patterns.append(filename)
 
@@ -2037,9 +2071,10 @@ def commit_changes(repo, repo_url, updated_submodules):
         logging.error(f"Failed to commit changes in '{get_repo_name(repo_url)}': {e}")
         sys.exit(1)
 
-def commit_changes_extended(repo, repo_url, updated_submodules, updated_yaml_files):
-    """Commit changes with a detailed message covering submodules and CI includes."""
+def commit_changes_extended(repo, repo_url, updated_submodules, updated_yaml_files, updated_env_files=None):
+    """Commit changes with a detailed message covering submodules, CI includes and dotenv edits."""
     commit_lines = []
+    updated_env_files = updated_env_files or {}
 
     # Add submodule updates to commit message
     if updated_submodules:
@@ -2082,6 +2117,15 @@ def commit_changes_extended(repo, repo_url, updated_submodules, updated_yaml_fil
             commit_lines.append("")
         commit_lines.append("Update CI variables:")
         commit_lines.extend(manual_yaml_updates)
+
+    # Add dotenv edits (update_env entries) to commit message
+    env_lines = [f" - {filename}: set {edit['key']} to '{edit['value']}'"
+                 for filename, edits in updated_env_files.items() for edit in edits]
+    if env_lines:
+        if commit_lines:
+            commit_lines.append("")
+        commit_lines.append("Update environment defaults:")
+        commit_lines.extend(env_lines)
 
     if not commit_lines:
         commit_lines.append("Update dependencies")
@@ -2221,6 +2265,113 @@ def merge_yaml_updates(manual_updates, auto_detected_updates):
 
     return merged
 
+def collect_env_updates(current_repo_settings, tag_name=None):
+    """Collect dotenv-style edits from the repo's 'update_env' entries.
+
+    Each entry sets `key` to `value` in `filename` (a KEY=value file such as
+    haf_api_node's .env.example). '$TAG' in the value is replaced with the tag
+    being created; entries with 'when: tag' are skipped when no tag is given.
+    """
+    updated_env_files = {}
+    for edit in current_repo_settings.get('update_env', []) or []:
+        if edit.get('when') == 'tag' and not tag_name:
+            continue
+        value = edit['value']
+        if tag_name:
+            value = value.replace('$TAG', tag_name)
+        entry = {'filename': edit['filename'], 'key': edit['key'], 'value': value}
+        updated_env_files.setdefault(edit['filename'], []).append(entry)
+    return updated_env_files
+
+
+def set_env_value(text, key, value):
+    """Return (new_text, old_value) with the first uncommented `key=` line of a
+    dotenv-style file set to `key=value`, preserving everything else (comments,
+    ordering, the line's original quoting is dropped in favour of the bare value).
+    Raises KeyError when no such line exists: creating the key silently could
+    put it in the wrong section of a hand-maintained file."""
+    pattern = re.compile(r'^(?P<indent>[ \t]*)(?P<key>' + re.escape(key) + r')=(?P<old>.*)$', re.M)
+    match = pattern.search(text)
+    if match is None:
+        raise KeyError(key)
+    new_text = text[:match.start()] + f"{match.group('indent')}{key}={value}" + text[match.end():]
+    return new_text, match.group('old')
+
+
+def update_env_files(clone_path, edits):
+    """Apply collected update_env edits; returns the entries that were applied."""
+    applied = []
+    for edit in edits:
+        env_path = os.path.join(clone_path, edit['filename'])
+        if not os.path.exists(env_path):
+            logging.error(f"Env file '{env_path}' does not exist.")
+            continue
+        with open(env_path, 'r') as f:
+            text = f.read()
+        try:
+            new_text, old_value = set_env_value(text, edit['key'], edit['value'])
+        except KeyError:
+            logging.error(f"Key '{edit['key']}' has no uncommented assignment in '{env_path}'; not updated.")
+            continue
+        if new_text == text:
+            logging.info(f"'{edit['key']}' in '{env_path}' already set to '{edit['value']}'.")
+            continue
+        with open(env_path, 'w') as f:
+            f.write(new_text)
+        logging.info(f"Updated env file '{env_path}': {edit['key']} '{old_value}' -> '{edit['value']}'.")
+        applied.append(edit)
+    return applied
+
+
+def process_env_updates(clone_path, updated_env_files):
+    """Apply and stage update_env edits (Phase 1). Returns {filename: [applied edits]}."""
+    result = {}
+    for filename, edits in updated_env_files.items():
+        applied = update_env_files(clone_path, edits)
+        if not applied:
+            continue
+        try:
+            Repo(clone_path).git.add(filename)
+            logging.debug(f"Staged env file '{filename}' for commit.")
+        except GitCommandError as e:
+            logging.error(f"Failed to stage env file '{filename}': {e}")
+            continue
+        result[filename] = applied
+    return result
+
+
+def validate_env_operations(config):
+    """Pre-validate update_env entries against already-cloned repositories
+    (repositories not yet cloned are skipped with a warning, as for YAML)."""
+    errors, warnings = [], []
+    for repo_url, settings in config.items():
+        entries = settings.get('update_env', []) or []
+        if not entries:
+            continue
+        clone_path = os.path.join(BASE_DIR, get_repo_name(repo_url))
+        if not os.path.exists(clone_path):
+            warnings.append(f"Repository '{repo_url}' not yet cloned, env validation skipped")
+            continue
+        for edit in entries:
+            env_path = os.path.join(clone_path, edit['filename'])
+            if not os.path.exists(env_path):
+                errors.append(f"Env file '{edit['filename']}' not found in repository '{repo_url}'")
+                continue
+            with open(env_path, 'r') as f:
+                text = f.read()
+            try:
+                set_env_value(text, edit['key'], 'probe')
+            except KeyError:
+                errors.append(f"Key '{edit['key']}' has no uncommented assignment in '{edit['filename']}' in repository '{repo_url}'")
+    for error in errors:
+        logging.error(error)
+    for warning in warnings:
+        logging.warning(warning)
+    if not errors:
+        logging.info("Env file validation passed")
+    return not errors, errors, warnings
+
+
 def process_yaml_updates(clone_path, updated_yaml_files, submodule_commits):
     """Process YAML file updates."""
     for filename, edits in updated_yaml_files.items():
@@ -2348,10 +2499,11 @@ def handle_tagging(repo, repo_url, tag, retag, dry_run):
     else:
         push_tag(repo, repo_url, tag)
 
-def log_commit_summary(repo_url, updated_submodules, updated_yaml_files, push_enabled):
+def log_commit_summary(repo_url, updated_submodules, updated_yaml_files, push_enabled, updated_env_files=None):
     """Log a summary of the commits."""
-    if not updated_submodules and not updated_yaml_files:
-        logging.info(f"No submodule or YAML file updates to commit in '{get_repo_name(repo_url)}'.")
+    updated_env_files = updated_env_files or {}
+    if not updated_submodules and not updated_yaml_files and not updated_env_files:
+        logging.info(f"No submodule, YAML or env file updates to commit in '{get_repo_name(repo_url)}'.")
         return
 
     commit_lines = []
@@ -2372,6 +2524,12 @@ def log_commit_summary(repo_url, updated_submodules, updated_yaml_files, push_en
                 elif 'submodule_referenced' in edit:
                     submodule_name = get_repo_name(edit['submodule_referenced'])
                     commit_lines.append(f" - {filename}: {edit['key_to_update']} updated for submodule '{submodule_name}'")
+
+    if updated_env_files:
+        commit_lines.append("Update env files:")
+        for filename, edits in updated_env_files.items():
+            for edit in edits:
+                commit_lines.append(f" - {filename}: {edit['key']} set to '{edit['value']}'")
 
     commit_message = "\n".join(commit_lines)
     logging.info(f"Commit summary for '{get_repo_name(repo_url)}':\n{commit_message}")
@@ -2794,6 +2952,10 @@ def main():
     yaml_valid, yaml_errors, yaml_warnings = validate_yaml_operations(config)
     if not yaml_valid:
         logging.error("YAML validation failed. Please fix the errors above and try again.")
+        sys.exit(1)
+    env_valid, env_errors, env_warnings = validate_env_operations(config)
+    if not env_valid:
+        logging.error("Env file validation failed. Please fix the errors above and try again.")
         sys.exit(1)
     
     # Initialize mappings to track repository state
