@@ -1,3 +1,4 @@
 GitPython
 ruamel.yaml
 PyYAML
+requests
