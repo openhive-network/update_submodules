@@ -10,22 +10,45 @@
 #
 # To run: `update-submodules.py --release-to-master --tag <version>`
 # (this file is auto-selected when --release-to-master is passed).
+#
+# 1.28.8: the release is the 1.28.8-rc3 snapshot, not develop tip.  Every
+# entry except hive pins `source_ref: '1.28.8-rc3'` because develop has moved
+# past rc3 in several repos (common-ci-configuration, haf_block_explorer,
+# haf_fyp, block_explorer_ui, denser, wax, ...) and none of that should ship
+# in 1.28.8.  hive releases develop so the version bump is included (see below).
+# The repo set matches what the develop-flow run tagged as rc3 (repos.yaml).
+# Repos whose only branch is master/main (tests_api, beekeeper, proxy-whitelist)
+# were rc3-tagged directly on that branch; pinning source_ref there makes the
+# script take the 0-commit path and tag the same commit (plus any submodule
+# bump) rather than look for a non-existent develop.
 
 # Base CI configuration - must be processed first as other repos depend on it
 git@gitlab.syncad.com:hive/common-ci-configuration.git:
   ref: 'main'
+  source_ref: '1.28.8-rc3'
   automerge: true
 
 # Core repos
+# hive is the one repo NOT pinned to rc3: 1.28.8 ships rc3 plus the mainnet
+# HIVE_BLOCKCHAIN_VERSION bump to 1.28.8 (MR off develop, 2026-10-05) and one
+# test-tooling dependency bump that landed on develop after rc3.  Run the
+# release once that MR has merged; pin source_ref to a commit SHA instead if
+# develop might receive anything else before the run.
 git@gitlab.syncad.com:hive/hive.git:
   ref: 'master'
-  # source_ref: '<develop-sha>'   # uncomment to release a specific develop commit
+  source_ref: 'develop'
   automerge: true
+  # Exchange docker template pins the hived image to the release being tagged
+  # (same rule as repos.yaml; rc3 carries HIVED_VERSION=1.28.8-rc3).
+  update_env:
+    - filename: 'docker/exchange/.env.example'
+      key: 'HIVED_VERSION'
+      value: '$TAG'
+      when: 'tag'
 
 git@gitlab.syncad.com:hive/haf.git:
   ref: 'master'
-  # or
-  # ref_from_dir: /path/to/local/checkout/of/haf
+  source_ref: '1.28.8-rc3'
   automerge: true
   # Manual entry needed: this is a local YAML include, not the main CI file
   update_yaml:
@@ -35,6 +58,7 @@ git@gitlab.syncad.com:hive/haf.git:
 
 git@gitlab.syncad.com:hive/haf_api_node.git:
   ref: 'master'
+  source_ref: '1.28.8-rc3'
   automerge: true
   # Point the operator template at the release being tagged (see repos.yaml).
   update_env:
@@ -49,6 +73,7 @@ git@gitlab.syncad.com:hive/haf_api_node.git:
 # variable with the tag name so the tagged builds pin against the released HAF.
 git@gitlab.syncad.com:hive/reputation_tracker.git:
   ref: 'main'
+  source_ref: '1.28.8-rc3'
   automerge: true
   update_yaml:
     - filename: '.gitlab-ci.yml'
@@ -58,6 +83,7 @@ git@gitlab.syncad.com:hive/reputation_tracker.git:
 
 git@gitlab.syncad.com:hive/balance_tracker.git:
   ref: 'master'
+  source_ref: '1.28.8-rc3'
   automerge: true
   update_yaml:
     - filename: '.gitlab-ci.yml'
@@ -67,6 +93,7 @@ git@gitlab.syncad.com:hive/balance_tracker.git:
 
 git@gitlab.syncad.com:hive/HAfAH.git:
   ref: 'master'
+  source_ref: '1.28.8-rc3'
   automerge: true
   update_yaml:
     - filename: '.gitlab-ci.yml'
@@ -76,6 +103,7 @@ git@gitlab.syncad.com:hive/HAfAH.git:
 
 git@gitlab.syncad.com:hive/hivemind.git:
   ref: 'master'
+  source_ref: '1.28.8-rc3'
   automerge: true
   update_yaml:
     # develop renamed .gitlab-ci.yaml -> .gitlab-ci.yml in commit c409f8cff;
@@ -93,6 +121,7 @@ git@gitlab.syncad.com:hive/hivemind.git:
 
 git@gitlab.syncad.com:hive/haf_block_explorer.git:
   ref: 'master'
+  source_ref: '1.28.8-rc3'
   automerge: true
   update_yaml:
     - filename: '.gitlab-ci.yml'
@@ -102,6 +131,7 @@ git@gitlab.syncad.com:hive/haf_block_explorer.git:
 
 git@gitlab.syncad.com:hive/hivesense.git:
   ref: 'main'
+  source_ref: '1.28.8-rc3'
   automerge: true
   update_yaml:
     - filename: '.gitlab-ci.yml'
@@ -111,29 +141,78 @@ git@gitlab.syncad.com:hive/hivesense.git:
 
 git@gitlab.syncad.com:hive/nft_tracker.git:
   ref: 'master'
+  source_ref: '1.28.8-rc3'
   automerge: true
 
+# haf_stats: in haf_api_node since !244 (own `haf-stats` profile). Its CI builds
+# on tag pipelines and mirrors the tagged images, so the release tag is what
+# makes ${HIVE_API_NODE_VERSION} resolve for it.  First release-to-main for
+# this repo: main is an ancestor of rc3, so this is a fast-forward.
+git@gitlab.syncad.com:hive/haf_stats.git:
+  ref: 'main'
+  source_ref: '1.28.8-rc3'
+  automerge: false
+  update_yaml:
+    - filename: '.gitlab-ci.yml'
+      key_to_update: 'find_haf_image.variables.UPSTREAM_BRANCH'
+      value: '$TAG'
+      when: 'tag'
+
+# haf_fyp: tagged alongside the stack.  Its CI publishes images only from the
+# default branch, so a tag pipeline builds nothing; the release tag is a git
+# tag only.  First release-to-main for this repo (fast-forward, see haf_stats).
+git@gitlab.syncad.com:hive/haf_fyp.git:
+  ref: 'main'
+  source_ref: '1.28.8-rc3'
+  automerge: false
+
 # User interfaces
-# block_explorer_ui is held at 1.28.6-rc14 for the 1.28.6 release because the
-# auth-system overhaul (Issue #672) on develop isn't appropriate for this patch.
-# source_ref pins the rebase source to rc14's commit instead of develop tip;
-# the rest of the workflow (rebase onto master, FF MR, tag) is unchanged.
-# Since rc14 is itself a develop commit, future releases tree-match cleanly
-# against develop without any special handling.
+# block_explorer_ui: for 1.28.6 this was pinned to 1.28.6-rc14; for 1.28.8 it
+# follows the stack and releases the rc3 snapshot like everything else.
 git@gitlab.syncad.com:hive/block_explorer_ui.git:
   ref: 'master'
-  source_ref: '1.28.6-rc14'
+  source_ref: '1.28.8-rc3'
   automerge: true
 
 git@gitlab.syncad.com:hive/denser.git:
   ref: 'main'
+  source_ref: '1.28.8-rc3'
   automerge: true
   update_yaml:
     - filename: '.gitlab-ci.yml'
       key_to_update: 'variables.HAF_COMMIT'
       submodule_referenced: 'git@gitlab.syncad.com:hive/haf.git'
 
+# Test utilities (submodules used by multiple repos).  master-only repo.
+git@gitlab.syncad.com:hive/tests_api.git:
+  ref: 'master'
+  source_ref: '1.28.8-rc3'
+  automerge: true
+
 # Tools
 git@gitlab.syncad.com:hive/drone.git:
   ref: 'master'
+  source_ref: '1.28.8-rc3'
+  automerge: true
+
+# wax: first release-to-master for this repo.  master has not been touched
+# since Feb 2026 and is an ancestor of rc3, so this is a fast-forward plus a
+# bump of the hive submodule to hive's release/1.28.8 commit.
+git@gitlab.syncad.com:hive/wax.git:
+  ref: 'master'
+  source_ref: '1.28.8-rc3'
+  automerge: true
+
+# beekeeper: master-only repo; rc3 was tagged on master.  It carries
+# common-ci-configuration as a submodule (npm-common-config), so it gets a
+# submodule bump + MR when common-ci-configuration's release commit changes.
+git@gitlab.syncad.com:hive/beekeeper.git:
+  ref: 'master'
+  source_ref: '1.28.8-rc3'
+  automerge: true
+
+# proxy-whitelist: main-only repo; rc3 was tagged on main.
+git@gitlab.syncad.com:hive/proxy-whitelist.git:
+  ref: 'main'
+  source_ref: '1.28.8-rc3'
   automerge: true

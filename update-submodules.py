@@ -1812,6 +1812,13 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
             if filename:
                 expected_patterns.append(filename)
 
+        # Files rewritten by auto-detected CI include updates (e.g. wax's
+        # .gitlab-ci.yml, which includes hive/hive and common-ci-configuration
+        # but has no update_yaml rule of its own) are expected changes too.
+        for filename in updated_yaml_files:
+            if filename not in expected_patterns:
+                expected_patterns.append(filename)
+
         is_valid, diff_info = verify_release_changes(
             clone_path, source_head, 'HEAD', expected_patterns
         )

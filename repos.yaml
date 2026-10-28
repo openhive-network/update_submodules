@@ -7,6 +7,11 @@ git@gitlab.syncad.com:hive/common-ci-configuration.git:
 git@gitlab.syncad.com:hive/hive.git:
   ref: 'develop'
   automerge: true
+  update_env:
+  - filename: docker/exchange/.env.example
+    key: HIVED_VERSION
+    value: $TAG
+    when: tag
 
 git@gitlab.syncad.com:hive/haf.git:
   ref: 'develop'
@@ -116,9 +121,9 @@ git@gitlab.syncad.com:hive/haf_fyp.git:
 # 1.28.6 directly on the rc14 commit (no commit, no MR — BE-UI has no
 # update_yaml rules and isn't referenced as a submodule by any other repo).
 git@gitlab.syncad.com:hive/block_explorer_ui.git:
-  ref: '10fcf8ee1b33fa5307c5819eea60de8d76ce49e8'
+  ref: develop
   create_merge_request: false
-  automerge: false
+  automerge: true
 
 git@gitlab.syncad.com:hive/denser.git:
   ref: 'develop'
@@ -146,9 +151,10 @@ git@gitlab.syncad.com:hive/beekeeper.git:
   ref: 'master'
   automerge: true
 
-git@gitlab.syncad.com:hive/hafsql.git:
-  ref: 'main'
-  automerge: true
+# we're no longer maintaining
+# git@gitlab.syncad.com:hive/hafsql.git:
+#   ref: 'main'
+#   automerge: true
 
 git@gitlab.syncad.com:hive/proxy-whitelist.git:
   ref: 'main'
