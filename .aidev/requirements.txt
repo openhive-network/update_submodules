@@ -1,0 +1,7 @@
+# Test environment for AIDEV's suites: the script's runtime imports plus pytest.
+# requirements.txt at the repo root lacks `requests`, which update-submodules.py imports.
+GitPython
+ruamel.yaml
+PyYAML
+requests
+pytest
