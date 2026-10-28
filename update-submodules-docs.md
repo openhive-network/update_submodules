@@ -229,6 +229,23 @@ error (the key is never created, so it cannot land in the wrong section of a
 hand-maintained file). The edit is staged into the same commit as the
 submodule and YAML updates and listed under "Update environment defaults:".
 
+### Release-mode merge-back (`--release-to-master`)
+
+After the release tag is created, the script records the release tip as an ancestor
+of the development branch without changing it: a merge commit with develop's tree
+and the release tip as second parent (`git merge -s ours`) on branch
+`merge-<tag>-into-<branch>`, pushed with an MR in Phase 2. This keeps `git describe`
+and version tooling on develop pointing at the release instead of the last rc.
+
+- `merge_back` (bool, default `true`): disable per repository.
+- `merge_back_branch` (string, default `develop`): branch to merge into. Skipped when it
+  does not exist on origin or already contains the release tip.
+- `merge_back_automerge` (bool, defaults to `automerge`).
+
+Note for repositories whose merge method is fast-forward only: the MR stays
+fast-forwardable only while develop does not move; if it does, re-create the merge-back
+by hand (`git merge -s ours <release tip>` on develop).
+
 ### Complete Example
 
 ```yaml

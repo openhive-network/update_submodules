@@ -43,6 +43,11 @@ git@gitlab.syncad.com:hive/repo.git:
       key: 'HIVE_API_NODE_VERSION'
       value: '$TAG'
       when: tag
+  # --release-to-master only:
+  source_ref: 'develop'    # What to release (default develop; a tag/commit pins a snapshot)
+  merge_back: true         # After tagging, ours-merge the release tip into develop (default true)
+  merge_back_branch: develop   # Branch that merge-back targets (default develop)
+  merge_back_automerge: true   # Auto-merge the merge-back MR (defaults to `automerge`)
 ```
 
 ## Common Commands
@@ -111,8 +116,22 @@ update_yaml:
 
 Key path syntax supports conditional matching: `include[project=hive/haf].ref` finds the list item where `project=hive/haf` and updates its `ref` field.
 
+### Release merge-back (`--release-to-master`)
+Releases land on master as rebased commits plus a release commit, and nothing used to
+bring that history back to develop, so release tags were unreachable from develop and
+`git describe` on develop kept reporting the last rc (develop wheels versioned as
+`1.28.8rc3.post<n>`, which PEP 440 sorts *before* `1.28.8`). After tagging, the script
+now creates `merge-<tag>-into-<branch>`: a merge commit on `origin/develop` with
+develop's own tree and the release tip as second parent (`git merge -s ours`), and
+pushes it in Phase 2 with an MR to develop. develop's files and submodule pointers do
+not change; only ancestry does. Skipped for master-only repos and when the tag is
+already reachable (fast-forward releases). Once a merge-back has landed, master is an
+ancestor of develop, so the next release takes the fast-forward path and master
+inherits develop's real history instead of rebased copies. The tree-matching in
+`find_rebase_base` excludes commits reachable from master for the same reason.
+
 ### Branch Naming
-Feature branches are named `update-submodules` or `update-submodules-for-<tag>`, with numeric suffixes (`-2`, `-3`) if the name already exists.
+Feature branches are named `update-submodules` or `update-submodules-for-<tag>`, with numeric suffixes (`-2`, `-3`) if the name already exists. Release mode uses `release/<tag>` and `merge-<tag>-into-<branch>`.
 
 ## Key Dependencies
 

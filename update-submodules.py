@@ -39,6 +39,8 @@ class RepoOperationResult:
     rebase_performed: bool = False  # Release mode: track if rebase was done
     conflicts_resolved: List = None  # Release mode: track resolved conflicts
     sanity_check_passed: bool = True  # Release mode: track sanity check result
+    merge_back_branch: Optional[str] = None  # Release mode: `-s ours` merge of the release tip into develop
+    merge_back_target: Optional[str] = None  # Release mode: branch the merge-back MR targets (e.g. develop)
 
     def __post_init__(self):
         if self.submodules_updated is None:
@@ -214,19 +216,42 @@ def find_rebase_base(repo_path: str, source_ref: str = 'develop',
             capture_output=True, text=True, check=True
         ).stdout.strip()
 
+        # Source already contained in target (e.g. a pinned source_ref that target has
+        # moved past, or a master-only repo whose source_ref is the tag on master): the
+        # base is the source commit itself and there is nothing to rebase.  Handled
+        # here because the `^target_branch` exclusion below would leave nothing to match.
+        if subprocess.run(['git', 'merge-base', '--is-ancestor', source_ref, target_branch],
+                          capture_output=True).returncode == 0:
+            source_commit = subprocess.run(['git', 'rev-parse', f'{source_ref}^{{commit}}'],
+                                           capture_output=True, text=True, check=True).stdout.strip()
+            logging.info(f"{source_ref} ({source_commit[:8]}) is already contained in {target_branch}; nothing to rebase")
+            return source_commit
+
         # Build tree → commit map for source_ref. git log is reverse-chronological,
         # so the first time we see a tree, that's the most recent commit with it.
-        result = subprocess.run(
-            ['git', 'log', '--pretty=format:%H %T', source_ref],
-            capture_output=True, text=True, check=True
-        )
+        #
+        # The map covers source's own history only: (a) commits not reachable from
+        # target — develop's own commits, including rc-tag commits on MR side branches
+        # that were merged later; (b) source's first-parent line, which adds the
+        # history target legitimately shares with it (repos whose master was
+        # fast-forwarded from develop).  What is left out is history that reaches
+        # source only through the second parent of a release merge-back
+        # (create_merge_back_branch makes the release tip an ancestor of develop with
+        # `-s ours`): without the exclusion the walk below would match master's
+        # HEAD against itself and the base would be a master commit, i.e. every
+        # original develop commit would be replayed onto master.
         tree_to_source = {}
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            if len(parts) == 2:
-                commit, tree = parts
-                if tree not in tree_to_source:
-                    tree_to_source[tree] = commit
+        for extra in ([f'^{target_branch}'], ['--first-parent']):
+            result = subprocess.run(
+                ['git', 'log', '--pretty=format:%H %T', *extra, source_ref],
+                capture_output=True, text=True, check=True
+            )
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if len(parts) == 2:
+                    commit, tree = parts
+                    if tree not in tree_to_source:
+                        tree_to_source[tree] = commit
         logging.debug(f"Indexed {len(tree_to_source)} unique trees on {source_ref}")
 
         # Walk target_branch from HEAD looking for a tree present on source_ref.
@@ -669,6 +694,15 @@ def validate_config(config):
         if create_mr is not None and not isinstance(create_mr, bool):
             logging.error(f"'create_merge_request' for repository '{repo_url}' must be a boolean value.")
             sys.exit(1)
+        # Validate release-mode merge-back settings if present
+        for key in ('merge_back', 'merge_back_automerge'):
+            if settings.get(key) is not None and not isinstance(settings[key], bool):
+                logging.error(f"'{key}' for repository '{repo_url}' must be a boolean value.")
+                sys.exit(1)
+        mbb = settings.get('merge_back_branch')
+        if mbb is not None and (not isinstance(mbb, str) or not mbb.strip()):
+            logging.error(f"'merge_back_branch' for repository '{repo_url}' must be a non-empty string.")
+            sys.exit(1)
         # Validate 'update_yaml' if present
         update_yaml = settings.get('update_yaml')
         if update_yaml:
@@ -779,7 +813,7 @@ def cleanup_existing_repo(repo):
         # Delete local branches from previous runs
         current_branch = repo.active_branch.name if not repo.head.is_detached else None
         for branch in repo.heads:
-            if 'update-submodules' in branch.name:
+            if 'update-submodules' in branch.name or is_merge_back_branch(branch.name):
                 if branch.name != current_branch:
                     try:
                         repo.delete_head(branch, force=True)
@@ -1386,6 +1420,100 @@ def create_merge_request(repo, source_branch, target_branch, automerge=False, mr
         push_options.append(f'merge_request.title={mr_title}')
     return push_options
 
+def merge_back_branch_name(tag, target_branch):
+    """Local/remote branch name carrying the `-s ours` merge of a release into target_branch."""
+    safe_target = target_branch.replace('/', '-')
+    return f"merge-{tag}-into-{safe_target}"
+
+
+def is_merge_back_branch(name):
+    return name.startswith('merge-') and '-into-' in name
+
+
+def create_merge_back_branch(clone_path, repo_url, tag, settings, result):
+    """Release mode, Phase 1: record the release tip as an ancestor of develop.
+
+    The release lands on master as rebased commits plus the release commit, and
+    nothing ever brings that history back to develop, so release tags are
+    unreachable from develop: `git describe` on develop keeps reporting the last
+    rc tag and develop builds version as e.g. 1.28.8rc3.post<n>, which PEP 440
+    orders *before* the 1.28.8 release they are newer than (wax#204).
+
+    Fix: a merge commit on top of `origin/<merge_back_branch>` whose tree is
+    develop's own tree (`git merge -s ours`) and whose second parent is the
+    release tip.  develop's files and its newer submodule pointers are untouched;
+    only ancestry changes, so the tag becomes reachable.  The commit is built
+    with plumbing (commit-tree) so the working tree, which still has the release
+    branch checked out for the sanity check, is never touched.  The branch is
+    pushed in Phase 2 with an MR to merge_back_branch.
+
+    Settings: `merge_back: false` disables it; `merge_back_branch` (default
+    'develop') names the branch to merge into.  Skipped when that branch does not
+    exist on origin (master-only repos) or already contains the release tip
+    (fast-forward releases).
+    """
+    if not settings.get('merge_back', True):
+        logging.debug(f"merge_back disabled for '{get_repo_name(repo_url)}'")
+        return
+    target = settings.get('merge_back_branch', 'develop')
+    name = get_repo_name(repo_url)
+
+    def git(*args, check=True):
+        return subprocess.run(['git', *args], cwd=clone_path, capture_output=True, text=True, check=check)
+
+    if git('rev-parse', '--verify', '--quiet', f'origin/{target}', check=False).returncode != 0:
+        logging.info(f"No origin/{target} in '{name}' — no merge-back needed")
+        return
+    release_tip = git('rev-parse', 'HEAD').stdout.strip()
+    if git('merge-base', '--is-ancestor', release_tip, f'origin/{target}', check=False).returncode == 0:
+        logging.info(f"Release tip {release_tip[:8]} is already reachable from origin/{target} in '{name}' — no merge-back needed")
+        return
+
+    target_tip = git('rev-parse', f'origin/{target}').stdout.strip()
+    target_tree = git('rev-parse', f'origin/{target}^{{tree}}').stdout.strip()
+    message = (
+        f"Merge release {tag} back into {target} (ours)\n\n"
+        f"Records the {tag} release history (master) as an ancestor of {target} so the\n"
+        f"release tag is reachable from {target} — `git describe` and version tooling on\n"
+        f"{target} builds now see {tag} instead of the last rc tag — while keeping\n"
+        f"{target}'s tree exactly as it was: no file changes, submodule pointers stay at\n"
+        f"{target}'s newer commits.  Equivalent to `git merge -s ours {release_tip[:12]}`.\n\n"
+        f"Created by update-submodules.py --release-to-master."
+    )
+    try:
+        merge_commit = git('commit-tree', target_tree, '-p', target_tip, '-p', release_tip, '-m', message).stdout.strip()
+        branch = merge_back_branch_name(tag, target)
+        git('branch', '-f', branch, merge_commit)
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Could not create merge-back commit in '{name}': {e.stderr.strip() if e.stderr else e}")
+        return
+    result.merge_back_branch = branch
+    result.merge_back_target = target
+    logging.info(
+        f"Phase 1: Created merge-back branch '{branch}' in '{name}' "
+        f"(ours-merge of release tip {release_tip[:8]} into origin/{target} {target_tip[:8]}), will push in Phase 2"
+    )
+
+
+def push_merge_back(repo, repo_url, result, tag):
+    """Phase 2: push the merge-back branch and open its MR to the develop branch."""
+    settings = result.settings or {}
+    branch, target = result.merge_back_branch, result.merge_back_target
+    automerge = settings.get('merge_back_automerge', settings.get('automerge', False))
+    mr_title = f"Merge release {tag} back into {target}"
+    try:
+        if settings.get('create_merge_request', True):
+            push_options = create_merge_request(repo, branch, target, automerge=automerge, mr_title=mr_title)
+            repo.remotes.origin.push(refspec=f"{branch}:{branch}", push_option=push_options, recurse_submodules='no')
+            logging.info(f"Pushed merge-back branch '{branch}' to '{repo_url}' with MR title '{mr_title}' targeting '{target}'.")
+        else:
+            repo.remotes.origin.push(refspec=f"{branch}:{branch}", recurse_submodules='no')
+            logging.info(f"Pushed merge-back branch '{branch}' to '{repo_url}'.")
+    except GitCommandError as e:
+        logging.error(f"Failed to push merge-back branch '{branch}' to '{repo_url}': {e}")
+        raise
+
+
 def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabled=False,
                 updated_repos_branches=None, updated_repos_commits=None,
                 release_to_master=False, force=False):
@@ -1842,6 +1970,12 @@ def update_repo(repo_url, desired_ref, config, tag=None, retag=False, push_enabl
                 logging.warning("Continuing due to --force flag")
         else:
             logging.info("Sanity check passed")
+
+    # Release mode: make the tagged release tip an ancestor of develop (see create_merge_back_branch).
+    if release_to_master and tag and result.success:
+        create_merge_back_branch(clone_path, repo_url, tag, settings, result)
+        if push_enabled and result.merge_back_branch:
+            push_merge_back(repo, repo_url, result, tag)
 
     return result
 
@@ -2674,9 +2808,9 @@ def run_cleanup(config, tag=None, dry_run=False):
         try:
             repo = Repo(clone_path)
 
-            # Delete local update-submodules branches
+            # Delete local update-submodules and merge-back branches
             for branch in repo.heads:
-                if 'update-submodules' in branch.name:
+                if 'update-submodules' in branch.name or is_merge_back_branch(branch.name):
                     if branch != repo.active_branch:
                         if dry_run:
                             logging.info(f"Would delete local branch '{branch.name}' in '{get_repo_name(repo_url)}'")
@@ -2687,10 +2821,10 @@ def run_cleanup(config, tag=None, dry_run=False):
                             except GitCommandError as e:
                                 logging.warning(f"Could not delete local branch '{branch.name}': {e}")
 
-            # Delete remote update-submodules branches
+            # Delete remote update-submodules and merge-back branches
             repo.remotes.origin.fetch()
             for ref in repo.remotes.origin.refs:
-                if 'update-submodules' in ref.remote_head:
+                if 'update-submodules' in ref.remote_head or is_merge_back_branch(ref.remote_head):
                     if dry_run:
                         logging.info(f"Would delete remote branch '{ref.remote_head}' in '{get_repo_name(repo_url)}'")
                     else:
@@ -2900,6 +3034,19 @@ def push_all_operations(operations, dependency_graph, sorted_repos,
             logging.error(f"Failed to push changes for '{repo_url}': {e}")
             push_failures.append(repo_url)
 
+    # Release mode: merge-back branches (release tip -> develop, `-s ours`) go last, once
+    # every release branch and tag is on the remote.
+    for repo_url in sorted_repos:
+        operation = operations.get(repo_url)
+        if not operation or not operation.success or not operation.merge_back_branch:
+            continue
+        logging.info(f"Pushing merge-back branch for '{get_repo_name(repo_url)}'...")
+        try:
+            push_merge_back(operation.repo_object, repo_url, operation, tag)
+        except Exception as e:
+            logging.error(f"Failed to push merge-back for '{repo_url}': {e}")
+            push_failures.append(repo_url)
+
     if push_failures:
         logging.error(f"Failed to push changes for the following repositories: {push_failures}")
         logging.error("You may need to manually push these or run with --cleanup to reset")
@@ -3013,7 +3160,7 @@ def main():
 
         for repo_url, operation in operations.items():
             settings = operation.settings
-            if operation.branch_name or operation.tag_to_create:
+            if operation.branch_name or operation.tag_to_create or operation.merge_back_branch:
                 logging.info(f"\n{get_repo_name(repo_url)}:")
 
                 # Branch and MR info
@@ -3053,6 +3200,14 @@ def main():
                 # Tag info
                 if operation.tag_to_create:
                     logging.info(f"  - Would push tag: {operation.tag_to_create} (already created locally)")
+
+                # Merge-back info (release mode)
+                if operation.merge_back_branch:
+                    automerge = settings.get('merge_back_automerge', settings.get('automerge', False))
+                    logging.info(f"  - Would push merge-back branch: {operation.merge_back_branch}")
+                    logging.info(f"  - Would create MR to {operation.merge_back_target}"
+                                 f"{' (with auto-merge)' if automerge else ''}"
+                                 f" — ours-merge: {operation.merge_back_target}'s tree unchanged, release tag becomes reachable")
         sys.exit(0)
     
     # ========================================================================

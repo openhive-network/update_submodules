@@ -9,8 +9,8 @@ many minutes and would produce slightly different commit SHAs (different
 committer timestamps), which in turn would force-update tags that were
 already pushed successfully.
 
-Walks each repo in the configured config file, reads release branches and
-local tags off disk, reconstructs the operations dict that the main script
+Walks each repo in the configured config file, reads release branches,
+merge-back branches (merge-<tag>-into-<branch>) and local tags off disk, reconstructs the operations dict that the main script
 builds during Phase 1, and calls push_all_operations() — same code path as
 a normal Phase 2.
 
@@ -105,8 +105,15 @@ def reconstruct_operations(us, config, sorted_repos, tag, skip_repos):
         else:
             logging.warning(f"'{repo_name}' has no local '{tag}' tag and no release branch — skipping tag")
 
-        if not result.branch_name and not result.tag_to_create:
-            logging.warning(f"'{repo_name}' has neither branch nor tag — nothing to push, skipping")
+        # Merge-back branch (release tip -> develop, `-s ours`) created by Phase 1
+        target = config[repo_url].get('merge_back_branch', 'develop')
+        mb = us.merge_back_branch_name(tag, target)
+        if mb in local_branches:
+            result.merge_back_branch = mb
+            result.merge_back_target = target
+
+        if not result.branch_name and not result.tag_to_create and not result.merge_back_branch:
+            logging.warning(f"'{repo_name}' has neither branch, tag nor merge-back branch — nothing to push, skipping")
             continue
 
         operations[repo_url] = result

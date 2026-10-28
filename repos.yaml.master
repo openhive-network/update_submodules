@@ -11,6 +11,11 @@
 # To run: `update-submodules.py --release-to-master --tag <version>`
 # (this file is auto-selected when --release-to-master is passed).
 #
+# After tagging, each repo also gets a `merge-<tag>-into-develop` branch + MR:
+# an ours-merge of the release tip into develop (develop's tree unchanged) so
+# the release tag is reachable from develop and `git describe`/version tooling
+# on develop sees it.  `merge_back: false` / `merge_back_branch:` override.
+#
 # 1.28.8: the release is the 1.28.8-rc3 snapshot, not develop tip.  Every
 # entry except hive pins `source_ref: '1.28.8-rc3'` because develop has moved
 # past rc3 in several repos (common-ci-configuration, haf_block_explorer,
