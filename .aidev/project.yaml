@@ -1,8 +1,9 @@
 # Profile for hive/update_submodules, written by `aidev project scaffold` (#13561).
 #
-# Schema reference: docs/architecture/project-profile.md
-# Onboarding procedure: the `onboard-external-project` skill.
-# Guide: docs/operations/onboarding-an-external-project.md
+# The profile schema (docs/architecture/project-profile.md), the
+# `onboard-external-project` skill and the onboarding guide
+# (docs/operations/onboarding-an-external-project.md) live in the aidev
+# repository, not in this one.
 #
 # The generator writes a starting point, not a governed answer: every
 # binding below is the command a maintainer said this project runs, and it
@@ -37,10 +38,12 @@ issues:
   # Reports about this project's work are filed against this project.
   watcher_reports: self
 
-# Verification slots. Each binding is what this project genuinely runs for
-# that slot — never one selection repeated under seven names, which makes
-# seven gates report on the same evidence while claiming to check seven
-# different things.
+# Verification slots. This project has one small pytest suite and no CI, so
+# quick, full, baseline, canary and coverage all run that same suite: there is
+# no narrower or broader selection to bind them to. `static` is the one check
+# that differs — the byte-compile of the top-level scripts, selected alone
+# (the whole suite includes it too). `system` is left unbound: there is no
+# running stack to exercise.
 verification:
   quick:
     adapter: pytest
@@ -56,11 +59,8 @@ verification:
     args: ["tests", "-q", "-p", "no:cacheprovider"]
   static:
     adapter: pytest
-    args: ["tests", "-q", "-p", "no:cacheprovider"]
+    args: ["tests/test_static.py", "-q", "-p", "no:cacheprovider"]
   coverage:
-    adapter: pytest
-    args: ["tests", "-q", "-p", "no:cacheprovider"]
-  system:
     adapter: pytest
     args: ["tests", "-q", "-p", "no:cacheprovider"]
 
