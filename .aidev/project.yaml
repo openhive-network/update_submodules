@@ -1,0 +1,68 @@
+# Profile for hive/update_submodules, written by `aidev project scaffold` (#13561).
+#
+# The profile schema (docs/architecture/project-profile.md), the
+# `onboard-external-project` skill and the onboarding guide
+# (docs/operations/onboarding-an-external-project.md) live in the aidev
+# repository, not in this one.
+#
+# The generator writes a starting point, not a governed answer: every
+# binding below is the command a maintainer said this project runs, and it
+# is reviewed and edited like any other declaration.
+version: 2
+project: update-submodules
+
+gitlab:
+  host: "gitlab.syncad.com"
+  path: "hive/update_submodules"
+  id: 494
+
+# AIDEV integrates into its own protected branch; `aidev handoff` carries it to
+# develop by merge request, which the maintainers review (same shape as the
+# other hive projects).
+branches:
+  integration: "aidev/integration"
+  handoff: "develop"
+
+# How this project's suites execute (#13892): one kind, stated once.
+environment:
+  kind: "requirements"
+  requirements: ".aidev/requirements.txt"
+
+issues:
+  intake_label: todo
+  taxonomy: ".aidev/labels.yaml"
+  decompose:
+    # `never` is where an external project starts: nothing marks work
+    # approved on this project's behalf until there is a track record.
+    auto_todo: never
+  # Reports about this project's work are filed against this project.
+  watcher_reports: self
+
+# Verification slots. This project has one small pytest suite and no CI, so
+# quick, full, baseline, canary and coverage all run that same suite: there is
+# no narrower or broader selection to bind them to. `static` is the one check
+# that differs — the byte-compile of the top-level scripts, selected alone
+# (the whole suite includes it too). `system` is left unbound: there is no
+# running stack to exercise.
+verification:
+  quick:
+    adapter: pytest
+    args: ["tests", "-q", "-p", "no:cacheprovider"]
+  full:
+    adapter: pytest
+    args: ["tests", "-q", "-p", "no:cacheprovider"]
+  baseline:
+    adapter: pytest
+    args: ["tests", "-q", "-p", "no:cacheprovider"]
+  canary:
+    adapter: pytest
+    args: ["tests", "-q", "-p", "no:cacheprovider"]
+  static:
+    adapter: pytest
+    args: ["tests/test_static.py", "-q", "-p", "no:cacheprovider"]
+  coverage:
+    adapter: pytest
+    args: ["tests", "-q", "-p", "no:cacheprovider"]
+
+# Capability grants for target-side code. Empty until this project needs one.
+capabilities: []

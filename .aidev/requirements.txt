@@ -1,0 +1,6 @@
+# Test environment for AIDEV's suites: the script's runtime imports plus pytest.
+GitPython
+ruamel.yaml
+PyYAML
+requests
+pytest
